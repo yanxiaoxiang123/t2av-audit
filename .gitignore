@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.runtime/
+.venv/
+*.jsonl
+*.wav
+*.mp4
+*.mov
+*.mkv
+gemini_credentials.json

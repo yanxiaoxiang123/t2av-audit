@@ -1,0 +1,3 @@
+interface:
+  display_name: "T2AV 审核"
+  short_description: "按原视频与实际生成提示词完成 17 项视听评分"
