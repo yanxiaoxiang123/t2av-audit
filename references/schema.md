@@ -186,6 +186,31 @@
     - 实际听取的音频区间。
     - 关键片段复查记录。
     - 使用的工具、原始日志路径，以及旋转处理和裁剪坐标映射记录。
+    - object_continuity_checks：当 PH 或 HM 因 Prompt 启用时，每项相关 Prompt 要求至少一条。逐条字段如下；无相关要求时为 []：
+
+        requirement_id        对应 prompt_checks.requirement_id
+        object_label          被追踪的同一物体或部件名称
+        expected_invariants   字符串；应保持的部件数量、形状/拓扑、连接与接触关系
+        before_frame_index    动作前原始帧号
+        during_frame_indices  非空数组；按 PTS 排序的动作中原始帧号
+        after_frame_index     动作后原始帧号
+        source_interval_sec   [开始, 结束]；连接变化的短区间，按源 PTS 定义
+        source_frame_indices  该区间全部源帧号，按 PTS 排序，不得抽样省略
+        board_manifest_path   continuity_board.py 生成的 board_manifest.json 绝对路径；记录固定 ROI 和无结论标签的对照板页
+        before_observation    动作前实际看到的结构与接触
+        transition_observation 动作中实际看到的变化；遮挡必须明说
+        after_observation     动作后实际看到的结构与状态
+        part_correspondence   非空数组；每项含 part_id、before_state、after_state、trajectory_explanation、status（tracked / occluded / unexplained）。固定部件名称后分别交代形状、自由端、连接及去向；不能把新环和旧腿合称“锁梁”而略过数量变化
+        unexplained_changes   字符串数组；无法解释的部件增减、闭环或连接变化。confirmed_consistent 时必须为空
+        topology_search       对象，必须包含 part_disappearance、new_closed_loop、connection_change 三项；每项含 status（not_seen / seen / uncertain）、observation 和已打开的 frame_indices。confirmed_consistent 时三项必须均为 not_seen；confirmed_defect 时至少一项必须为 seen
+        initial_verdict       初审结论：confirmed_consistent / confirmed_defect / uncertain
+        challenge_review      反证复核；method=independent_agent / self_blind、verdict、observation、frame_indices。复核者只看原始视频/Prompt 与无初审标签的对照板
+        conflict_resolution   初审与复核冲突时的解决记录，含 verdict、observation、frame_indices；未解决时为 null，最终只能 uncertain
+        verdict               最终结论：confirmed_consistent / confirmed_defect / uncertain
+        affected_metric_ids   确认缺陷时非空，列出被此缺陷影响的已评分指标；否则为 []
+        evidence_ids          非空数组；其证据帧须覆盖所列前/中/后帧
+
+    inspection.original_frames_opened 必须包含上述前/中/后和反证复核使用的原图帧号；对照板浏览与单独打开原图须如实区分。部件 status 为 occluded 或 unexplained、或 unexplained_changes 非空时，不得写 confirmed_consistent。该字段是人工反证检查的可追溯记录；校验器只能检查完整性、源帧覆盖、引用和内部矛盾，不能自动判定画面语义。确认缺陷所影响的指标不可给 5 分；不确定结论按疑罪从无原则处理并记录限制。
 
     8、validation：输出校验结果
 
@@ -194,8 +219,8 @@
         all_17_metrics_present    17 个指标是否完整且唯一
         references_valid          所有 ID 引用是否有效
         files_verified            所有证据文件是否已重新打开核验
-        coordinates_verified      位置框是否符合坐标规范且覆盖所述区域
-        score_evidence_complete   每个分数的必需证据是否齐全
+        coordinates_verified      标注图尺寸及位置框坐标是否符合规范；目标是否真的位于框内须目视判断
+        score_evidence_complete   每个分数的必需证据字段和引用是否齐全；不认证图像语义
 
     errors：字符串数组，记录具体校验错误；无错误为 []。
     检查未执行时填 null；只有实际检查通过才填 true，失败填 false。

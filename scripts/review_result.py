@@ -16,6 +16,11 @@ import wave
 METRICS = "VQ AE VF AQ AF AV TS DC LS TX PH MU PR SB HM MT PS".split()
 UNIVERSAL = set(METRICS[:7])
 AUDIO_METRICS = {"AQ", "AF", "AV", "DC", "LS", "MU", "PR", "SB", "MT"}
+CONTINUITY_VERDICTS = {"confirmed_consistent", "confirmed_defect", "uncertain"}
+PART_STATUSES = {"tracked", "occluded", "unexplained"}
+CHALLENGE_METHODS = {"independent_agent", "self_blind"}
+TOPOLOGY_SEARCH_FIELDS = ("part_disappearance", "new_closed_loop", "connection_change")
+TOPOLOGY_SEARCH_STATUSES = {"not_seen", "seen", "uncertain"}
 
 
 def anchors():
@@ -124,6 +129,204 @@ def check_path(path, errors, label):
         errors.append(f"{label}: file cannot be reopened")
         return None
     return p
+
+
+def validate_continuity(checks, evidence, metric_items, inspection, frame_map, viewed, opened, pts, err):
+    """Validate declared continuity work, not the semantic truth of the images."""
+    req_set = {check.get("requirement_id") for check in checks}
+    ev_set = {item.get("evidence_id") for item in evidence}
+    metric_map = {item.get("metric_id"): item for item in metric_items}
+    evidence_map = {item.get("evidence_id"): item for item in evidence}
+    pts_map = {index: frame.get("time_sec") for index, frame in frame_map.items()}
+    active_physical = {mid for mid in ("PH", "HM") if metric_map.get(mid, {}).get("status") == "已评分"}
+    physical_requirements = {
+        check.get("requirement_id") for check in checks
+        if active_physical.intersection(check.get("metric_ids") or [])
+    }
+    continuity = inspection.get("object_continuity_checks")
+    if not isinstance(continuity, list):
+        err("scores", "inspection.object_continuity_checks must be an array")
+        continuity = []
+    covered_requirements = set()
+    for index, check in enumerate(continuity):
+        label = f"object_continuity_checks[{index}]"
+        if not isinstance(check, dict):
+            err("scores", f"{label}: check must be an object")
+            continue
+        requirement_id = check.get("requirement_id")
+        if requirement_id not in req_set:
+            err("references", f"{label}: unknown requirement_id")
+        elif requirement_id in physical_requirements:
+            covered_requirements.add(requirement_id)
+        for field in ("object_label", "expected_invariants", "before_observation",
+                      "transition_observation", "after_observation"):
+            if not isinstance(check.get(field), str) or not check[field].strip():
+                err("scores", f"{label}: {field} is required")
+        frame_indices = [check.get("before_frame_index")]
+        during = check.get("during_frame_indices")
+        if not isinstance(during, list) or not during:
+            err("scores", f"{label}: during_frame_indices must be nonempty")
+            during = []
+        frame_indices.extend(during)
+        frame_indices.append(check.get("after_frame_index"))
+        valid_indices = all(type(n) is int and n in frame_map for n in frame_indices)
+        if not valid_indices:
+            err("references", f"{label}: frame index is absent from source manifest")
+        elif (any(frame_map[a]["time_sec"] >= frame_map[b]["time_sec"]
+                  for a, b in zip(frame_indices, frame_indices[1:])) or
+              any(n not in viewed for n in frame_indices)):
+            err("scores", f"{label}: frames must be viewed and strictly ordered by source PTS")
+        if valid_indices and any(n not in opened for n in frame_indices):
+            err("scores", f"{label}: before/during/after originals must be individually opened")
+        interval = check.get("source_interval_sec")
+        source_indices = check.get("source_frame_indices")
+        selected = []
+        if (not isinstance(interval, list) or len(interval) != 2 or
+                any(type(t) not in (int, float) or not math.isfinite(t) for t in interval) or
+                interval[0] < 0 or interval[0] >= interval[1]):
+            err("references", f"{label}: invalid source_interval_sec")
+        else:
+            selected = [p["frame_index"] for p in pts
+                        if interval[0] - 1e-6 <= p["time_sec"] <= interval[1] + 1e-6]
+            source_times = [pts_map[n] for n in source_indices] if isinstance(source_indices, list) and all(
+                type(n) is int and n in pts_map for n in source_indices) else []
+            if (not selected or source_indices != selected or not set(selected) <= set(frame_map) or
+                    any(a >= b for a, b in zip(source_times, source_times[1:]))):
+                err("references", f"{label}: source interval must include every extracted source frame")
+            if valid_indices and not set(during) <= set(selected):
+                err("references", f"{label}: during frames must fall inside source interval")
+        board_manifest_path = check.get("board_manifest_path")
+        board = check_path(board_manifest_path, [], f"{label}.board_manifest_path")
+        if board is None:
+            err("files", f"{label}: continuity board manifest is missing")
+        else:
+            try:
+                board_data = json.loads(board.read_text(encoding="utf-8"))
+                if not isinstance(board_data, dict):
+                    raise ValueError("board manifest must be an object")
+                if (board_data.get("interval_sec") != interval or
+                        board_data.get("source_frame_indices") != source_indices or
+                        not isinstance(board_data.get("roi_xyxy"), list) or
+                        len(board_data["roi_xyxy"]) != 4):
+                    err("references", f"{label}: board manifest differs from continuity interval")
+                board_paths = board_data.get("board_paths")
+                if not isinstance(board_paths, list) or not board_paths:
+                    err("files", f"{label}: board pages are missing")
+                else:
+                    for path in board_paths:
+                        board_image = check_path(path, [], f"{label}.board")
+                        if board_image is None:
+                            err("files", f"{label}: board page is missing")
+                        else:
+                            image_size(board_image)
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                err("files", f"{label}: unreadable continuity board ({type(exc).__name__})")
+        parts = check.get("part_correspondence")
+        if not isinstance(parts, list) or not parts:
+            err("scores", f"{label}: part_correspondence must be nonempty")
+            parts = []
+        part_ids = []
+        for part in parts:
+            if not isinstance(part, dict):
+                err("scores", f"{label}: each part correspondence must be an object")
+                continue
+            if isinstance(part.get("part_id"), str):
+                part_ids.append(part["part_id"])
+            for field in ("part_id", "before_state", "after_state", "trajectory_explanation"):
+                if not isinstance(part.get(field), str) or not part[field].strip():
+                    err("scores", f"{label}: part {field} is required")
+            if part.get("status") not in PART_STATUSES:
+                err("scores", f"{label}: invalid part status")
+        if len(part_ids) != len(set(part_ids)):
+            err("scores", f"{label}: duplicate part_id")
+        unexplained = check.get("unexplained_changes")
+        if not isinstance(unexplained, list) or any(not isinstance(x, str) or not x.strip() for x in unexplained):
+            err("scores", f"{label}: unexplained_changes must be a string array")
+            unexplained = []
+        topology_search = check.get("topology_search")
+        if not isinstance(topology_search, dict):
+            err("scores", f"{label}: topology_search is required")
+            topology_search = {}
+        for search_name in TOPOLOGY_SEARCH_FIELDS:
+            item = topology_search.get(search_name)
+            if not isinstance(item, dict) or item.get("status") not in TOPOLOGY_SEARCH_STATUSES:
+                err("scores", f"{label}: topology_search.{search_name}.status is required")
+                continue
+            search_frames = item.get("frame_indices")
+            if (not isinstance(search_frames, list) or not search_frames or any(
+                    type(n) is not int or n not in frame_map or n not in opened for n in search_frames)):
+                err("references", f"{label}: topology_search.{search_name}.frame_indices must be opened originals")
+            if not isinstance(item.get("observation"), str) or not item["observation"].strip():
+                err("scores", f"{label}: topology_search.{search_name}.observation is required")
+        search_statuses = [topology_search.get(name, {}).get("status") for name in TOPOLOGY_SEARCH_FIELDS]
+        if check.get("verdict") == "confirmed_consistent" and any(status != "not_seen" for status in search_statuses):
+            err("scores", f"{label}: confirmed_consistent requires all topology searches to be not_seen")
+        if check.get("verdict") == "confirmed_defect" and not any(status == "seen" for status in search_statuses):
+            err("scores", f"{label}: confirmed_defect requires a seen topology search result")
+        if check.get("verdict") == "confirmed_consistent" and (
+                unexplained or any(p.get("status") != "tracked" for p in parts if isinstance(p, dict))):
+            err("scores", f"{label}: unresolved parts or changes contradict confirmed_consistent")
+        initial = check.get("initial_verdict")
+        challenge = check.get("challenge_review")
+        if initial not in CONTINUITY_VERDICTS:
+            err("scores", f"{label}: initial_verdict is required")
+        if not isinstance(challenge, dict):
+            err("scores", f"{label}: challenge_review is required")
+            challenge = {}
+        if challenge.get("method") not in CHALLENGE_METHODS or challenge.get("verdict") not in CONTINUITY_VERDICTS:
+            err("scores", f"{label}: invalid challenge method or verdict")
+        if not isinstance(challenge.get("observation"), str) or not challenge["observation"].strip():
+            err("scores", f"{label}: challenge observation is required")
+        challenge_frames = challenge.get("frame_indices")
+        if not isinstance(challenge_frames, list) or not challenge_frames or any(
+                type(n) is not int or n not in frame_map or n not in opened for n in challenge_frames):
+            err("references", f"{label}: challenge frames must be individually opened originals")
+        resolution = check.get("conflict_resolution")
+        if resolution is not None:
+            if initial == challenge.get("verdict"):
+                err("scores", f"{label}: conflict_resolution is only allowed for reviewer disagreement")
+            if not isinstance(resolution, dict) or resolution.get("verdict") not in CONTINUITY_VERDICTS or not isinstance(
+                    resolution.get("observation"), str) or not resolution["observation"].strip() or not isinstance(
+                    resolution.get("frame_indices"), list) or not resolution["frame_indices"] or any(
+                    type(n) is not int or n not in frame_map or n not in opened for n in resolution["frame_indices"]):
+                err("scores", f"{label}: invalid conflict_resolution")
+            elif check.get("verdict") != resolution["verdict"]:
+                err("scores", f"{label}: final verdict differs from conflict resolution")
+        elif initial in CONTINUITY_VERDICTS and challenge.get("verdict") in CONTINUITY_VERDICTS:
+            if initial == challenge["verdict"] and check.get("verdict") != initial:
+                err("scores", f"{label}: final verdict differs from agreeing reviews")
+            if initial != challenge["verdict"] and check.get("verdict") != "uncertain":
+                err("scores", f"{label}: unresolved reviewer conflict cannot be confirmed")
+        evidence_ids = check.get("evidence_ids")
+        if not isinstance(evidence_ids, list) or not evidence_ids or any(eid not in ev_set for eid in evidence_ids):
+            err("references", f"{label}: evidence_ids must reference saved evidence")
+        elif valid_indices:
+            evidenced_frames = {
+                frame.get("frame_index") for eid in evidence_ids
+                for frame in evidence_map[eid].get("frames", [])
+            }
+            if not set(frame_indices) <= evidenced_frames:
+                err("references", f"{label}: before/during/after frames are not covered by evidence_ids")
+        verdict = check.get("verdict")
+        if verdict not in CONTINUITY_VERDICTS:
+            err("scores", f"{label}: invalid verdict")
+        affected = check.get("affected_metric_ids")
+        if not isinstance(affected, list) or any(mid not in metric_map for mid in affected):
+            err("references", f"{label}: invalid affected_metric_ids")
+            affected = []
+        if verdict == "confirmed_defect":
+            if not affected:
+                err("scores", f"{label}: confirmed defect needs affected_metric_ids")
+            for mid in affected:
+                metric = metric_map[mid]
+                if metric.get("status") != "已评分":
+                    err("scores", f"{label}: affected metric {mid} is not scored")
+                elif metric.get("score") == 5:
+                    err("scores", f"{label}: confirmed defect contradicts {mid} score 5")
+        elif affected:
+            err("scores", f"{label}: only confirmed defects may list affected_metric_ids")
+    for requirement_id in sorted(physical_requirements - covered_requirements):
+        err("scores", f"{requirement_id}: missing object continuity check")
 
 
 def validate(record, review_dir, boxes_reviewed):
@@ -320,6 +523,11 @@ def validate(record, review_dir, boxes_reviewed):
             required.add(pts[nearest]["frame_index"])
         if not required <= set(viewed):
             err("scores", "Full-video 4-fps PTS coverage is missing from viewed frames")
+    opened = inspection.get("original_frames_opened") or []
+    if not isinstance(opened, list) or any(type(n) is not int or n not in frame_map for n in opened):
+        err("scores", "inspection.original_frames_opened must list saved source frames")
+        opened = []
+    validate_continuity(checks, evidence, metric_items, inspection, frame_map, viewed, opened, pts, err)
     if not inspection.get("visual_inspection_intervals_sec"):
         err("scores", "inspection.visual_inspection_intervals_sec is required")
     if not inspection.get("tools"):
