@@ -13,14 +13,15 @@ import re
 import sys
 import wave
 
+from workflow_common import (
+    DIMENSION_ISSUE_CATEGORY, ISSUE_METRICS, PHYSICAL_CLAIM_TYPES, SEVERITY_CAPS,
+    STATE_DIMENSIONS, VERDICTS, read_json, required_metrics, sha256_bytes,
+    sha256_file, validate_board_manifest, validate_prompt_plan, collect_asset_hashes,
+)
+
 METRICS = "VQ AE VF AQ AF AV TS DC LS TX PH MU PR SB HM MT PS".split()
 UNIVERSAL = set(METRICS[:7])
 AUDIO_METRICS = {"AQ", "AF", "AV", "DC", "LS", "MU", "PR", "SB", "MT"}
-CONTINUITY_VERDICTS = {"confirmed_consistent", "confirmed_defect", "uncertain"}
-PART_STATUSES = {"tracked", "occluded", "unexplained"}
-CHALLENGE_METHODS = {"independent_agent", "self_blind"}
-TOPOLOGY_SEARCH_FIELDS = ("part_disappearance", "new_closed_loop", "connection_change")
-TOPOLOGY_SEARCH_STATUSES = {"not_seen", "seen", "uncertain"}
 
 
 def anchors():
@@ -131,202 +132,257 @@ def check_path(path, errors, label):
     return p
 
 
-def validate_continuity(checks, evidence, metric_items, inspection, frame_map, viewed, opened, pts, err):
-    """Validate declared continuity work, not the semantic truth of the images."""
-    req_set = {check.get("requirement_id") for check in checks}
-    ev_set = {item.get("evidence_id") for item in evidence}
+def verify_workflow(record, review_dir, prepared, err):
+    """Verify immutable stage checkpoints and return their decoded contents."""
+    root = review_dir / "workflow"
+    try:
+        state = read_json(root / "state.json")
+    except (OSError, ValueError, TypeError):
+        err("files", "staged workflow is missing or unreadable")
+        return None, None, None
+    if not isinstance(state, dict):
+        err("files", "staged workflow state must be an object")
+        return None, None, None
+    if state.get("schema_version") != "t2av_score_v1" or state.get("workflow_version") != 1:
+        err("scores", "unsupported staged workflow version")
+    expected_prompt_hash = sha256_bytes(prepared["prompt"].encode("utf-8"))
+    if state.get("prompt_sha256") != expected_prompt_hash:
+        err("references", "workflow prompt hash differs from prepared input")
+    decoded = {}
+    for stage in ("plan", "initial", "challenge"):
+        item = (state.get("stages") or {}).get(stage)
+        path = root / f"{stage}.json"
+        if not isinstance(item, dict) or not path.is_file():
+            err("files", f"workflow stage {stage} is not frozen")
+            continue
+        try:
+            if item.get("checkpoint_path") != str(path.resolve()) or item.get("checkpoint_sha256") != sha256_file(path):
+                err("references", f"workflow stage {stage} checkpoint hash mismatch")
+            decoded[stage] = read_json(path)
+            if collect_asset_hashes(decoded[stage], review_dir) != item.get("asset_sha256"):
+                err("references", f"workflow stage {stage} asset hash mismatch or incomplete inventory")
+            for raw, digest in (item.get("asset_sha256") or {}).items():
+                asset = Path(raw)
+                if not asset.is_file() or sha256_file(asset) != digest:
+                    err("references", f"workflow stage {stage} asset hash mismatch: {raw}")
+        except (OSError, ValueError, TypeError, AttributeError):
+            err("files", f"workflow stage {stage} cannot be verified")
+    plan, initial, challenge = (decoded.get(name) for name in ("plan", "initial", "challenge"))
+    from review_workflow import validate_initial, validate_challenge
+    if isinstance(plan, dict) and isinstance(initial, dict):
+        try:
+            points = read_json(review_dir / "logs" / "frame_pts.json")
+            for message in validate_initial(initial, plan, points):
+                err("scores", f"frozen initial: {message}")
+            if isinstance(challenge, dict):
+                for message in validate_challenge(challenge, initial):
+                    err("scores", f"frozen challenge: {message}")
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            err("scores", "invalid frozen stage structure")
+    if isinstance(plan, dict):
+        for message in validate_prompt_plan(plan, prepared["prompt"]):
+            err("scores", f"frozen plan: {message}")
+        final_map = {item.get("requirement_id"): item for item in record.get("prompt_checks", [])}
+        for planned in plan.get("prompt_checks", []):
+            final = final_map.get(planned.get("requirement_id"), {})
+            for key, value in planned.items():
+                if final.get(key) != value:
+                    err("references", f"{planned.get('requirement_id')}: final prompt check differs from frozen plan field {key}")
+    final_transitions = {
+        item.get("transition_id"): item
+        for item in (record.get("inspection") or {}).get("state_transition_checks", [])
+        if isinstance(item, dict)
+    }
+    if isinstance(initial, dict):
+        frozen = initial.get("state_transition_checks", [])
+        if set(final_transitions) != {item.get("transition_id") for item in frozen}:
+            err("references", "final state transitions differ from frozen initial transition IDs")
+        for item in frozen:
+            final = final_transitions.get(item.get("transition_id"), {})
+            for key, value in item.items():
+                if final.get(key) != value:
+                    err("references", f"{item.get('transition_id')}: final transition differs from frozen initial field {key}")
+    if isinstance(challenge, dict):
+        frozen_reviews = challenge.get("challenge_reviews", [])
+        if set(final_transitions) != {item.get("transition_id") for item in frozen_reviews}:
+            err("references", "final state transitions differ from frozen challenge transition IDs")
+        for item in frozen_reviews:
+            if final_transitions.get(item.get("transition_id"), {}).get("challenge_review") != item:
+                err("references", f"{item.get('transition_id')}: final challenge differs from frozen checkpoint")
+    if isinstance(plan, dict):
+        planned_ids = {item.get("requirement_id") for item in plan.get("prompt_checks", [])}
+        final_ids = {item.get("requirement_id") for item in record.get("prompt_checks", [])}
+        if planned_ids != final_ids:
+            err("references", "final prompt check IDs differ from frozen plan")
+    return plan, initial, challenge
+
+
+def validate_state_transitions(checks, evidence, metric_items, inspection, frame_map,
+                               viewed, opened, pts, prompt_check_map, err):
+    """Validate local state-transition coverage and deterministic score propagation."""
+    transitions = inspection.get("state_transition_checks")
+    if not isinstance(transitions, list):
+        err("scores", "inspection.state_transition_checks must be an array")
+        return
     metric_map = {item.get("metric_id"): item for item in metric_items}
     evidence_map = {item.get("evidence_id"): item for item in evidence}
-    pts_map = {index: frame.get("time_sec") for index, frame in frame_map.items()}
-    active_physical = {mid for mid in ("PH", "HM") if metric_map.get(mid, {}).get("status") == "已评分"}
-    physical_requirements = {
-        check.get("requirement_id") for check in checks
-        if active_physical.intersection(check.get("metric_ids") or [])
+    pts_map = {p.get("frame_index"): p.get("time_sec") for p in pts}
+    strict_requirements = {
+        item.get("requirement_id") for item in checks
+        if item.get("claim_type") in PHYSICAL_CLAIM_TYPES
     }
-    continuity = inspection.get("object_continuity_checks")
-    if not isinstance(continuity, list):
-        err("scores", "inspection.object_continuity_checks must be an array")
-        continuity = []
-    covered_requirements = set()
-    for index, check in enumerate(continuity):
-        label = f"object_continuity_checks[{index}]"
+    requirement_map = {item.get("requirement_id"): item for item in checks}
+    covered = set()
+    for index, check in enumerate(transitions):
+        label = f"state_transition_checks[{index}]"
         if not isinstance(check, dict):
-            err("scores", f"{label}: check must be an object")
+            err("scores", f"{label}: must be an object")
             continue
-        requirement_id = check.get("requirement_id")
-        if requirement_id not in req_set:
-            err("references", f"{label}: unknown requirement_id")
-        elif requirement_id in physical_requirements:
-            covered_requirements.add(requirement_id)
-        for field in ("object_label", "expected_invariants", "before_observation",
-                      "transition_observation", "after_observation"):
-            if not isinstance(check.get(field), str) or not check[field].strip():
-                err("scores", f"{label}: {field} is required")
-        frame_indices = [check.get("before_frame_index")]
-        during = check.get("during_frame_indices")
-        if not isinstance(during, list) or not during:
-            err("scores", f"{label}: during_frame_indices must be nonempty")
-            during = []
-        frame_indices.extend(during)
-        frame_indices.append(check.get("after_frame_index"))
-        valid_indices = all(type(n) is int and n in frame_map for n in frame_indices)
-        if not valid_indices:
-            err("references", f"{label}: frame index is absent from source manifest")
-        elif (any(frame_map[a]["time_sec"] >= frame_map[b]["time_sec"]
-                  for a, b in zip(frame_indices, frame_indices[1:])) or
-              any(n not in viewed for n in frame_indices)):
-            err("scores", f"{label}: frames must be viewed and strictly ordered by source PTS")
-        if valid_indices and any(n not in opened for n in frame_indices):
-            err("scores", f"{label}: before/during/after originals must be individually opened")
+        rid = check.get("requirement_id")
+        if rid not in strict_requirements:
+            err("references", f"{label}: does not reference a strict physical action")
+        else:
+            covered.add(rid)
         interval = check.get("source_interval_sec")
         source_indices = check.get("source_frame_indices")
-        selected = []
         if (not isinstance(interval, list) or len(interval) != 2 or
                 any(type(t) not in (int, float) or not math.isfinite(t) for t in interval) or
-                interval[0] < 0 or interval[0] >= interval[1]):
-            err("references", f"{label}: invalid source_interval_sec")
+                interval[0] < 0 or interval[0] >= interval[1] or interval[1] - interval[0] > 2.000001):
+            err("references", f"{label}: local interval must be valid and no longer than 2 seconds")
+            selected = []
         else:
             selected = [p["frame_index"] for p in pts
                         if interval[0] - 1e-6 <= p["time_sec"] <= interval[1] + 1e-6]
-            source_times = [pts_map[n] for n in source_indices] if isinstance(source_indices, list) and all(
-                type(n) is int and n in pts_map for n in source_indices) else []
-            if (not selected or source_indices != selected or not set(selected) <= set(frame_map) or
-                    any(a >= b for a, b in zip(source_times, source_times[1:]))):
-                err("references", f"{label}: source interval must include every extracted source frame")
-            if valid_indices and not set(during) <= set(selected):
-                err("references", f"{label}: during frames must fall inside source interval")
-        board_manifest_path = check.get("board_manifest_path")
-        board = check_path(board_manifest_path, [], f"{label}.board_manifest_path")
-        if board is None:
-            err("files", f"{label}: continuity board manifest is missing")
+            if source_indices != selected or not selected or not set(selected) <= set(frame_map):
+                err("references", f"{label}: interval must include every extracted source frame")
+        sequence = [check.get("before_frame_index"), *(check.get("during_frame_indices") or []),
+                    check.get("after_frame_index")]
+        valid = (len(sequence) >= 3 and all(type(n) is int and n in frame_map for n in sequence))
+        if not valid:
+            err("references", f"{label}: before/during/after frames are invalid")
+        elif (any(pts_map[a] >= pts_map[b] for a, b in zip(sequence, sequence[1:])) or
+              any(n not in viewed for n in sequence)):
+            err("scores", f"{label}: before/during/after frames must be viewed and PTS ordered")
+        elif not all(interval[0] - 1e-6 <= pts_map[n] <= interval[1] + 1e-6 for n in sequence):
+            err("references", f"{label}: before/during/after frames must be inside the local interval")
         else:
-            try:
-                board_data = json.loads(board.read_text(encoding="utf-8"))
-                if not isinstance(board_data, dict):
-                    raise ValueError("board manifest must be an object")
-                if (board_data.get("interval_sec") != interval or
-                        board_data.get("source_frame_indices") != source_indices or
-                        not isinstance(board_data.get("roi_xyxy"), list) or
-                        len(board_data["roi_xyxy"]) != 4):
-                    err("references", f"{label}: board manifest differs from continuity interval")
-                board_paths = board_data.get("board_paths")
-                if not isinstance(board_paths, list) or not board_paths:
-                    err("files", f"{label}: board pages are missing")
-                else:
-                    for path in board_paths:
-                        board_image = check_path(path, [], f"{label}.board")
-                        if board_image is None:
-                            err("files", f"{label}: board page is missing")
-                        else:
-                            image_size(board_image)
-            except (OSError, ValueError, TypeError, KeyError) as exc:
-                err("files", f"{label}: unreadable continuity board ({type(exc).__name__})")
-        parts = check.get("part_correspondence")
-        if not isinstance(parts, list) or not parts:
-            err("scores", f"{label}: part_correspondence must be nonempty")
-            parts = []
-        part_ids = []
-        for part in parts:
-            if not isinstance(part, dict):
-                err("scores", f"{label}: each part correspondence must be an object")
-                continue
-            if isinstance(part.get("part_id"), str):
-                part_ids.append(part["part_id"])
-            for field in ("part_id", "before_state", "after_state", "trajectory_explanation"):
-                if not isinstance(part.get(field), str) or not part[field].strip():
-                    err("scores", f"{label}: part {field} is required")
-            if part.get("status") not in PART_STATUSES:
-                err("scores", f"{label}: invalid part status")
-        if len(part_ids) != len(set(part_ids)):
-            err("scores", f"{label}: duplicate part_id")
-        unexplained = check.get("unexplained_changes")
-        if not isinstance(unexplained, list) or any(not isinstance(x, str) or not x.strip() for x in unexplained):
-            err("scores", f"{label}: unexplained_changes must be a string array")
-            unexplained = []
-        topology_search = check.get("topology_search")
-        if not isinstance(topology_search, dict):
-            err("scores", f"{label}: topology_search is required")
-            topology_search = {}
-        for search_name in TOPOLOGY_SEARCH_FIELDS:
-            item = topology_search.get(search_name)
-            if not isinstance(item, dict) or item.get("status") not in TOPOLOGY_SEARCH_STATUSES:
-                err("scores", f"{label}: topology_search.{search_name}.status is required")
-                continue
-            search_frames = item.get("frame_indices")
-            if (not isinstance(search_frames, list) or not search_frames or any(
-                    type(n) is not int or n not in frame_map or n not in opened for n in search_frames)):
-                err("references", f"{label}: topology_search.{search_name}.frame_indices must be opened originals")
-            if not isinstance(item.get("observation"), str) or not item["observation"].strip():
-                err("scores", f"{label}: topology_search.{search_name}.observation is required")
-        search_statuses = [topology_search.get(name, {}).get("status") for name in TOPOLOGY_SEARCH_FIELDS]
-        if check.get("verdict") == "confirmed_consistent" and any(status != "not_seen" for status in search_statuses):
-            err("scores", f"{label}: confirmed_consistent requires all topology searches to be not_seen")
-        if check.get("verdict") == "confirmed_defect" and not any(status == "seen" for status in search_statuses):
-            err("scores", f"{label}: confirmed_defect requires a seen topology search result")
-        if check.get("verdict") == "confirmed_consistent" and (
-                unexplained or any(p.get("status") != "tracked" for p in parts if isinstance(p, dict))):
-            err("scores", f"{label}: unresolved parts or changes contradict confirmed_consistent")
-        initial = check.get("initial_verdict")
-        challenge = check.get("challenge_review")
-        if initial not in CONTINUITY_VERDICTS:
-            err("scores", f"{label}: initial_verdict is required")
-        if not isinstance(challenge, dict):
-            err("scores", f"{label}: challenge_review is required")
-            challenge = {}
-        if challenge.get("method") not in CHALLENGE_METHODS or challenge.get("verdict") not in CONTINUITY_VERDICTS:
-            err("scores", f"{label}: invalid challenge method or verdict")
-        if not isinstance(challenge.get("observation"), str) or not challenge["observation"].strip():
-            err("scores", f"{label}: challenge observation is required")
-        challenge_frames = challenge.get("frame_indices")
-        if not isinstance(challenge_frames, list) or not challenge_frames or any(
-                type(n) is not int or n not in frame_map or n not in opened for n in challenge_frames):
-            err("references", f"{label}: challenge frames must be individually opened originals")
-        resolution = check.get("conflict_resolution")
-        if resolution is not None:
-            if initial == challenge.get("verdict"):
-                err("scores", f"{label}: conflict_resolution is only allowed for reviewer disagreement")
-            if not isinstance(resolution, dict) or resolution.get("verdict") not in CONTINUITY_VERDICTS or not isinstance(
-                    resolution.get("observation"), str) or not resolution["observation"].strip() or not isinstance(
-                    resolution.get("frame_indices"), list) or not resolution["frame_indices"] or any(
-                    type(n) is not int or n not in frame_map or n not in opened for n in resolution["frame_indices"]):
-                err("scores", f"{label}: invalid conflict_resolution")
-            elif check.get("verdict") != resolution["verdict"]:
-                err("scores", f"{label}: final verdict differs from conflict resolution")
-        elif initial in CONTINUITY_VERDICTS and challenge.get("verdict") in CONTINUITY_VERDICTS:
-            if initial == challenge["verdict"] and check.get("verdict") != initial:
-                err("scores", f"{label}: final verdict differs from agreeing reviews")
-            if initial != challenge["verdict"] and check.get("verdict") != "uncertain":
-                err("scores", f"{label}: unresolved reviewer conflict cannot be confirmed")
+            boundary = [p["frame_index"] for p in pts
+                        if pts_map[sequence[0]] - 1e-6 <= p["time_sec"] <= pts_map[sequence[-1]] + 1e-6]
+            initial_opened = check.get("initial_evidence_frame_indices") or []
+            if not set(boundary) <= set(initial_opened) or not set(boundary) <= set(opened):
+                err("scores", f"{label}: every source frame between stable states must be individually opened")
+        board_path = Path(check.get("board_manifest_path", ""))
+        board_errors, _ = validate_board_manifest(board_path, interval, source_indices)
+        for message in board_errors:
+            err("files" if "missing" in message or "unreadable" in message else "references",
+                f"{label}: {message}")
         evidence_ids = check.get("evidence_ids")
-        if not isinstance(evidence_ids, list) or not evidence_ids or any(eid not in ev_set for eid in evidence_ids):
+        if not isinstance(evidence_ids, list) or not evidence_ids or any(eid not in evidence_map for eid in evidence_ids):
             err("references", f"{label}: evidence_ids must reference saved evidence")
-        elif valid_indices:
-            evidenced_frames = {
-                frame.get("frame_index") for eid in evidence_ids
-                for frame in evidence_map[eid].get("frames", [])
-            }
-            if not set(frame_indices) <= evidenced_frames:
-                err("references", f"{label}: before/during/after frames are not covered by evidence_ids")
+        elif valid:
+            evidenced = {f.get("frame_index") for eid in evidence_ids
+                         for f in evidence_map[eid].get("frames", [])}
+            if not set(sequence) <= evidenced:
+                err("references", f"{label}: before/during/after frames are not covered by evidence")
+        dimensions = check.get("dimension_checks") or []
+        statuses = {item.get("status") for item in dimensions if isinstance(item, dict)}
+        if {item.get("dimension") for item in dimensions if isinstance(item, dict)} != set(STATE_DIMENSIONS):
+            err("scores", f"{label}: all nine state dimensions are required")
+        challenge = check.get("challenge_review") or {}
+        dimensions = dimensions + (challenge.get("dimension_findings") or [])
+        statuses = {item.get("status") for item in dimensions if isinstance(item, dict)}
+        initial_verdict, challenge_verdict = check.get("initial_verdict"), challenge.get("verdict")
         verdict = check.get("verdict")
-        if verdict not in CONTINUITY_VERDICTS:
-            err("scores", f"{label}: invalid verdict")
+        if initial_verdict not in VERDICTS or challenge_verdict not in VERDICTS or verdict not in VERDICTS:
+            err("scores", f"{label}: invalid initial, challenge, or final verdict")
+        challenge_frames = challenge.get("frame_indices")
+        if (not isinstance(challenge_frames, list) or not challenge_frames or
+                any(type(n) is not int or n not in frame_map or n not in opened for n in challenge_frames)):
+            err("references", f"{label}: challenge frames must be individually opened source frames")
+        resolution = check.get("conflict_resolution")
+        if initial_verdict != challenge_verdict and resolution is None and verdict != "uncertain":
+            err("scores", f"{label}: unresolved reviewer conflict must remain uncertain")
+        if initial_verdict == challenge_verdict and resolution is None and verdict != initial_verdict:
+            err("scores", f"{label}: final verdict differs from agreeing frozen reviews")
+        if resolution is not None:
+            resolution_frames = resolution.get("frame_indices") if isinstance(resolution, dict) else None
+            if (not isinstance(resolution, dict) or resolution.get("verdict") not in VERDICTS or
+                    verdict != resolution.get("verdict") or
+                    not isinstance(resolution.get("observation"), str) or not resolution["observation"].strip() or
+                    not isinstance(resolution_frames, list) or not resolution_frames or
+                    any(type(n) is not int or n not in frame_map or n not in opened for n in resolution_frames)):
+                err("scores", f"{label}: invalid conflict_resolution")
+        unresolved = ("applicable_uncertain" in statuses or
+                      any(e.get("status") in {"occluded", "unexplained"}
+                          for e in check.get("entity_ledger", []) if isinstance(e, dict)))
+        defective = "applicable_defect" in statuses
+        if verdict == "confirmed_consistent" and (unresolved or defective):
+            err("scores", f"{label}: unresolved or defective state contradicts confirmed_consistent")
+        if verdict == "confirmed_defect" and not defective:
+            err("scores", f"{label}: confirmed_defect requires an applicable_defect dimension")
+        if verdict == "uncertain" and not (unresolved or initial_verdict != challenge_verdict):
+            err("scores", f"{label}: uncertain requires unresolved state or reviewer conflict")
+        categories = check.get("issue_categories")
+        if not isinstance(categories, list) or any(category not in ISSUE_METRICS for category in categories):
+            err("scores", f"{label}: issue_categories are invalid")
+            categories = []
         affected = check.get("affected_metric_ids")
         if not isinstance(affected, list) or any(mid not in metric_map for mid in affected):
-            err("references", f"{label}: invalid affected_metric_ids")
+            err("references", f"{label}: affected_metric_ids are invalid")
             affected = []
-        if verdict == "confirmed_defect":
-            if not affected:
-                err("scores", f"{label}: confirmed defect needs affected_metric_ids")
+        mandatory = required_metrics(categories)
+        if verdict in {"uncertain", "confirmed_defect"}:
+            derived_categories = {
+                DIMENSION_ISSUE_CATEGORY[item["dimension"]]
+                for item in dimensions if isinstance(item, dict) and
+                item.get("dimension") in DIMENSION_ISSUE_CATEGORY and
+                item.get("status") in {"applicable_uncertain", "applicable_defect"}
+            }
+            derived_categories.update({"prompt_action", "sequence"})
+            if requirement_map.get(rid, {}).get("claim_type") == "human_object_action":
+                derived_categories.add("human_object_relation")
+            if len(strict_requirements) > 1:
+                derived_categories.add("multi_step_process")
+            if not derived_categories <= set(categories):
+                err("scores", f"{label}: issue_categories omit derived categories {sorted(derived_categories - set(categories))}")
+            mandatory.update(required_metrics(derived_categories))
+            if not categories or not affected:
+                err("scores", f"{label}: unresolved findings need categories and affected metrics")
+            if not mandatory <= set(affected):
+                err("scores", f"{label}: defect categories were not propagated to {sorted(mandatory - set(affected))}")
             for mid in affected:
                 metric = metric_map[mid]
                 if metric.get("status") != "已评分":
                     err("scores", f"{label}: affected metric {mid} is not scored")
-                elif metric.get("score") == 5:
-                    err("scores", f"{label}: confirmed defect contradicts {mid} score 5")
-        elif affected:
-            err("scores", f"{label}: only confirmed defects may list affected_metric_ids")
-    for requirement_id in sorted(physical_requirements - covered_requirements):
-        err("scores", f"{requirement_id}: missing object continuity check")
+                elif verdict == "uncertain" and metric.get("score", 99) > 3:
+                    err("scores", f"{label}: uncertain finding caps {mid} at 3")
+            if verdict == "confirmed_defect":
+                severity = check.get("severity")
+                if severity not in SEVERITY_CAPS:
+                    err("scores", f"{label}: confirmed defect needs minor, major, or critical severity")
+                else:
+                    cap = SEVERITY_CAPS[severity]
+                    for mid in affected:
+                        if metric_map[mid].get("status") == "已评分" and metric_map[mid].get("score", 99) > cap:
+                            err("scores", f"{label}: {severity} defect caps {mid} at {cap}")
+                if prompt_check_map.get(rid, {}).get("status") == "已呈现":
+                    err("scores", f"{label}: confirmed defect is not reflected in its prompt check")
+            elif check.get("severity") is not None:
+                err("scores", f"{label}: only confirmed defects have severity")
+        else:
+            if categories or affected or check.get("severity") is not None:
+                err("scores", f"{label}: consistent transition cannot carry issue fields")
+    for rid in sorted(strict_requirements - covered):
+        err("scores", f"{rid}: missing state transition check")
+
+
+def validate_audio_boundaries(checks, metric_items, err):
+    metric_map = {item.get("metric_id"): item for item in metric_items}
+    explicit_af = any(check.get("claim_type") == "audio" and "AF" in (check.get("metric_ids") or [])
+                      for check in checks)
+    af_metric = metric_map.get("AF", {})
+    if not explicit_af and af_metric.get("status") == "已评分" and af_metric.get("score") != 5:
+        err("scores", "AF cannot be reduced when the Prompt has no explicit audio requirement")
 
 
 def validate(record, review_dir, boxes_reviewed):
@@ -373,6 +429,7 @@ def validate(record, review_dir, boxes_reviewed):
     if any(not x or not isinstance(x, str) for x in ev_ids) or len(set(ev_ids)) != len(ev_ids):
         err("references", "Evidence IDs must be nonempty and unique")
     req_set, ev_set = set(req_ids), set(ev_ids)
+    verify_workflow(record, review_dir, prepared, err)
     rubric = anchors()
     for m in metric_items:
         mid = m.get("metric_id")
@@ -418,6 +475,7 @@ def validate(record, review_dir, boxes_reviewed):
             err("references", f"{check.get('requirement_id')}: broken metric or evidence reference")
         if check.get("status") not in ("已呈现", "部分呈现", "未呈现", "与要求矛盾", "无法判断"):
             err("scores", f"{check.get('requirement_id')}: invalid prompt check status")
+    validate_audio_boundaries(checks, metric_items, err)
     frame_map = {f["frame_index"]: f for f in manifest}
     for ev in evidence:
         eid = ev.get("evidence_id")
@@ -527,7 +585,9 @@ def validate(record, review_dir, boxes_reviewed):
     if not isinstance(opened, list) or any(type(n) is not int or n not in frame_map for n in opened):
         err("scores", "inspection.original_frames_opened must list saved source frames")
         opened = []
-    validate_continuity(checks, evidence, metric_items, inspection, frame_map, viewed, opened, pts, err)
+    prompt_check_map = {item.get("requirement_id"): item for item in checks}
+    validate_state_transitions(checks, evidence, metric_items, inspection, frame_map,
+                               viewed, opened, pts, prompt_check_map, err)
     if not inspection.get("visual_inspection_intervals_sec"):
         err("scores", "inspection.visual_inspection_intervals_sec is required")
     if not inspection.get("tools"):

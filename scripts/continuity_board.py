@@ -4,17 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
 import sys
 
 
-def make_boards(review_dir, start, end, roi, name, columns=4, rows=4):
+def make_boards(review_dir, start, end, roi, name, columns=2, rows=2):
     from PIL import Image, ImageDraw, ImageFont
 
     review_dir = Path(review_dir).expanduser().resolve(strict=True)
-    if not (0 <= start < end) or columns < 1 or rows < 1:
+    if not (0 <= start < end) or not (1 <= columns <= 2 and 1 <= rows <= 2):
         raise ValueError("Invalid interval or grid dimensions")
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         raise ValueError("Name must contain only letters, digits, underscores, or hyphens")
@@ -56,10 +57,20 @@ def make_boards(review_dir, start, end, roi, name, columns=4, rows=4):
         path = output_dir / f"board_{page_start // per_page:03d}.png"
         board.save(path)
         paths.append(str(path.resolve()))
+    def digest(raw_path):
+        value = hashlib.sha256()
+        with Path(raw_path).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                value.update(chunk)
+        return value.hexdigest()
+
     report = {
         "interval_sec": [start, end], "roi_xyxy": list(roi),
         "source_frame_indices": [item["frame_index"] for item in selected],
+        "columns": columns, "rows": rows,
+        "original_frame_size": [width, height],
         "board_paths": paths,
+        "board_sha256": {path: digest(path) for path in paths},
     }
     report_path = output_dir / "board_manifest.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -73,8 +84,8 @@ def main():
     parser.add_argument("--end", type=float, required=True)
     parser.add_argument("--roi", type=int, nargs=4, metavar=("LEFT", "TOP", "RIGHT", "BOTTOM"), required=True)
     parser.add_argument("--name", required=True)
-    parser.add_argument("--columns", type=int, default=4)
-    parser.add_argument("--rows", type=int, default=4)
+    parser.add_argument("--columns", type=int, default=2)
+    parser.add_argument("--rows", type=int, default=2)
     args = parser.parse_args()
     try:
         print(json.dumps(make_boards(args.review_dir, args.start, args.end, args.roi,
