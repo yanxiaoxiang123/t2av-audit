@@ -28,7 +28,7 @@ $PYTHON scripts/review_workflow.py freeze-challenge /absolute/run /absolute/CHAL
 $PYTHON scripts/analyze_audio.py /absolute/video.mp4 --output-dir /absolute/video.mp4.t2av-review/<run>/audio/primary
 ```
 
-The reviewing model must actually inspect every required source frame. Build `draft.json` only from the frozen checkpoints, render and review annotations, then finalize it:
+The reviewing model must inspect every required source frame. Native-size 2×2 ROI pages can cover intermediate frames, with key and ambiguous originals opened separately; strict original-by-original inspection remains available. Build `draft.json` only from the frozen checkpoints, render and review annotations, then finalize it:
 
 Transition records must bind observations to the current action's actor and target, track distinguishable parts with visual anchors, and support occlusion explanations with explicit evidence. Invisible internal mechanisms alone do not justify a defect or uncertainty score cap. These contracts are enforced when freezing the initial review and rechecked during finalization.
 

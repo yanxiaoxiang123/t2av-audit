@@ -160,6 +160,36 @@ class StagedReviewTests(unittest.TestCase):
         errors = validate_initial({"state_transition_checks": [bad]}, self.plan, self.pts)
         self.assertTrue(any("every source frame between stable states" in e for e in errors))
 
+    def test_native_board_covers_intermediate_frames_without_false_original_claim(self):
+        check = json.loads(json.dumps(self.initial_check))
+        check.update(inspection_mode="native_board", native_resolution_verified=True,
+                     board_pages_viewed=[str(self.board_image.resolve())],
+                     board_reviewed_frame_indices=[1, 2, 3, 4],
+                     initial_evidence_frame_indices=[1, 2, 4], during_frame_indices=[2])
+        self.assertEqual(validate_initial({"state_transition_checks": [check]}, self.plan, self.pts), [])
+        check["board_pages_viewed"] = []
+        self.assertTrue(any("every board page" in e for e in
+                            validate_initial({"state_transition_checks": [check]}, self.plan, self.pts)))
+
+    def test_native_board_cannot_skip_key_original_or_resolution_check(self):
+        check = json.loads(json.dumps(self.initial_check))
+        check.update(inspection_mode="native_board", native_resolution_verified=False,
+                     board_pages_viewed=[str(self.board_image.resolve())],
+                     board_reviewed_frame_indices=[1, 2, 3, 4],
+                     initial_evidence_frame_indices=[1, 2], during_frame_indices=[2])
+        errors = validate_initial({"state_transition_checks": [check]}, self.plan, self.pts)
+        self.assertTrue(any("not downscaled" in e for e in errors))
+        self.assertTrue(any("key originals" in e for e in errors))
+
+    def test_oversized_native_board_is_rejected(self):
+        Image.new("RGB", (1601, 10)).save(self.board_image)
+        self.write_board(self.board, [0.1, 0.4], [1, 2, 3, 4], [0, 0, 16, 16])
+        check = dict(self.initial_check, inspection_mode="native_board", native_resolution_verified=True,
+                     board_pages_viewed=[str(self.board_image.resolve())],
+                     board_reviewed_frame_indices=[1, 2, 3, 4])
+        self.assertTrue(any("exceed 1600" in e for e in
+                            validate_initial({"state_transition_checks": [check]}, self.plan, self.pts)))
+
     def test_challenge_requires_frozen_initial_and_new_evidence(self):
         challenge = {"challenge_reviews": [{
             "transition_id": "T1", "method": "self_blind", "verdict": "confirmed_consistent",

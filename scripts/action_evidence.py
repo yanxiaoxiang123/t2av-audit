@@ -1,6 +1,7 @@
 """Check action-scoped evidence contracts; does not infer image semantics."""
 
 from __future__ import annotations
+from inspection_coverage import inspection_frames
 
 
 def validate_action_evidence(check, requirement):
@@ -16,8 +17,8 @@ def validate_action_evidence(check, requirement):
     entities = {e.get("entity_id"): e for e in ledger if isinstance(e.get("entity_id"), str)}
     if len(entities) != len(ledger) or not roots <= set(entities):
         errors.append("entity ledger must contain unique IDs including action subject and object")
-    opened = check.get("initial_evidence_frame_indices", [])
-    opened = set(opened) if isinstance(opened, list) and all(type(n) is int for n in opened) else set()
+    opened, coverage_errors = inspection_frames(check)
+    errors.extend(coverage_errors)
 
     def frames(value):
         return isinstance(value, list) and bool(value) and all(type(n) is int and n in opened for n in value)

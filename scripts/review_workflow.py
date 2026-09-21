@@ -10,6 +10,7 @@ import math
 from pathlib import Path
 import sys
 from action_evidence import validate_action_evidence
+from inspection_coverage import inspection_frames
 
 from workflow_common import (
     INITIAL_REQUIRED_FIELDS, PHYSICAL_CLAIM_TYPES, STATE_DIMENSIONS, VERDICTS,
@@ -149,8 +150,12 @@ def validate_initial(value, plan, pts):
         else:
             boundary = [p["frame_index"] for p in ordered_pts
                         if pts_map[sequence[0]] - 1e-6 <= p["time_sec"] <= pts_map[sequence[-1]] + 1e-6]
-            if not set(boundary) <= set(check["initial_evidence_frame_indices"]):
+            inspected, coverage_errors = inspection_frames(check)
+            errors.extend(f"{label}: {e}" for e in coverage_errors)
+            if not set(boundary) <= inspected:
                 errors.append(f"{label}: every source frame between stable states must be individually opened")
+            if not set(sequence) <= set(check["initial_evidence_frame_indices"]):
+                errors.append(f"{label}: before/during/after key originals must still be opened")
         board_path = Path(check["board_manifest_path"])
         board_errors, _ = validate_board_manifest(board_path, interval, selected)
         errors.extend(f"{label}: {message}" for message in board_errors)
@@ -261,7 +266,8 @@ def validate_challenge(value, initial):
         unknown_frames = set(frames) - set(original["source_frame_indices"])
         if unknown_frames:
             errors.append(f"{label}: challenge frames must belong to the frozen local interval")
-        has_new_frames = bool(set(frames) - set(original["initial_evidence_frame_indices"])) and not unknown_frames
+        initial_seen, _ = inspection_frames(original)
+        has_new_frames = bool(set(frames) - initial_seen) and not unknown_frames
         tighter = False
         board_raw = review.get("board_manifest_path")
         if isinstance(board_raw, str):

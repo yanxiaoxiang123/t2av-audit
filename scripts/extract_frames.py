@@ -91,7 +91,7 @@ def extract(review_dir, start, end, fps=4.0, all_frames=False):
                 expression = "+".join(f"eq(n\\,{p['frame_index']})" for p in missing)
                 command = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-i", record["video_path"],
                            "-map", "0:v:0", "-vf", "select=" + expression, "-vsync", "0",
-                           "-start_number", "0", str(temp / "frame_%06d.png")]
+                           "-frames:v", str(len(missing)), "-start_number", "0", str(temp / "frame_%06d.png")]
                 result = subprocess.run(command, capture_output=True, text=True, timeout=1800)
                 if result.returncode:
                     raise ValueError("ffmpeg frame extraction failed: " + result.stderr.strip()[:500])

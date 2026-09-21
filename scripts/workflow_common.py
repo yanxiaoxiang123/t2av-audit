@@ -207,6 +207,7 @@ def collect_asset_hashes(value, review_dir: Path | None = None) -> dict[str, str
         frame_indices = set()
         for item in value.get("state_transition_checks", []) if isinstance(value, dict) else []:
             frame_indices.update(item.get("initial_evidence_frame_indices") or [])
+            frame_indices.update(item.get("board_reviewed_frame_indices") or [])
         for item in value.get("challenge_reviews", []) if isinstance(value, dict) else []:
             frame_indices.update(item.get("frame_indices") or [])
         for index in frame_indices:

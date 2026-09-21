@@ -42,7 +42,7 @@
 - `dimension_checks[]`：九个维度各一项，含 `dimension / status / observation / frame_indices[] / strongest_counterexample`
 - `strongest_counterexamples[]`
 - `initial_verdict`：`confirmed_consistent / confirmed_defect / uncertain`
-- `initial_evidence_frame_indices`：必须包含稳定前后态之间每个源帧
+- `initial_evidence_frame_indices`：实际单独打开的原图。originals 模式覆盖整个边界；native_board 模式至少覆盖前/中/后关键帧及疑点
 - `evidence_ids[]`
 
 实体 `status` 为 `tracked / occluded / unexplained`。维度及状态见 [state_transition_protocol.md](state_transition_protocol.md)。
@@ -56,6 +56,8 @@
 - 不确定/缺陷维度：`alternative_explanations={normal_explanation,anomaly_explanation,discriminating_observation}`。
 
 枚举值、适用条件和视觉判断边界详见状态转换协议中的“动作、部件和可观察性合同”。旧版冻结记录缺少这些字段时不再通过。
+
+效率模式：`inspection_mode` 默认为 originals，可选 native_board。后者必填 `board_pages_viewed / board_reviewed_frame_indices / native_resolution_verified`；页和帧必须完整匹配局部板 manifest，实际展示保持原像素且页长边不超过1600。这三个字段随初审冻结；不会增加 original_frames_opened。无法满足可读性条件时回退 originals。
 
 ## 3. 冻结反证 `CHALLENGE.json`
 

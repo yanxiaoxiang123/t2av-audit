@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import sys
 import wave
+from inspection_coverage import inspection_frames
 
 from workflow_common import (
     DIMENSION_ISSUE_CATEGORY, ISSUE_METRICS, PHYSICAL_CLAIM_TYPES, SEVERITY_CAPS,
@@ -161,10 +162,6 @@ def verify_workflow(record, review_dir, prepared, err):
             decoded[stage] = read_json(path)
             if collect_asset_hashes(decoded[stage], review_dir) != item.get("asset_sha256"):
                 err("references", f"workflow stage {stage} asset hash mismatch or incomplete inventory")
-            for raw, digest in (item.get("asset_sha256") or {}).items():
-                asset = Path(raw)
-                if not asset.is_file() or sha256_file(asset) != digest:
-                    err("references", f"workflow stage {stage} asset hash mismatch: {raw}")
         except (OSError, ValueError, TypeError, AttributeError):
             err("files", f"workflow stage {stage} cannot be verified")
     plan, initial, challenge = (decoded.get(name) for name in ("plan", "initial", "challenge"))
@@ -269,8 +266,13 @@ def validate_state_transitions(checks, evidence, metric_items, inspection, frame
             boundary = [p["frame_index"] for p in pts
                         if pts_map[sequence[0]] - 1e-6 <= p["time_sec"] <= pts_map[sequence[-1]] + 1e-6]
             initial_opened = check.get("initial_evidence_frame_indices") or []
-            if not set(boundary) <= set(initial_opened) or not set(boundary) <= set(opened):
+            inspected, coverage_errors = inspection_frames(check)
+            for message in coverage_errors:
+                err("scores", f"{label}: {message}")
+            if not set(boundary) <= inspected or not set(initial_opened) <= set(opened):
                 err("scores", f"{label}: every source frame between stable states must be individually opened")
+            if not set(sequence) <= set(opened):
+                err("scores", f"{label}: before/during/after key originals must still be opened")
         board_path = Path(check.get("board_manifest_path", ""))
         board_errors, _ = validate_board_manifest(board_path, interval, source_indices)
         for message in board_errors:

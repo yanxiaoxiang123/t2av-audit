@@ -14,7 +14,11 @@
 
 每个严格动作至少建立一个 `state_transition_check`。单窗口不超过 2 秒；较长动作拆成首尾相接的多个窗口。窗口必须同时包含稳定前态、变化过程和稳定后态，并提取窗口内每个源帧。
 
-从最后一个稳定前态到第一个稳定后态之间的每张原图都必须单独打开。`viewed_frame_indices` 表示目视过的保存帧；`original_frames_opened` 与 `initial_evidence_frame_indices` 必须真实记录单独打开的原图，不能把“已提取”或“看过板”写成“已打开原图”。
+从最后一个稳定前态到第一个稳定后态之间必须覆盖每个源帧。默认优先 `inspection_mode=native_board`：查看所有原像素 2×2 局部板页，单页长边不超过1600像素，确认工具展示未缩小、目标细节可辨；单独打开前/中/后关键原图及每个疑点的连续原图。板太大、被显示工具缩小、对象离开 ROI 或有歧义时，改为 `originals` 并逐张打开边界内原图。不能为提速缩小目标后宣称等价检查。
+
+native_board 记录 `board_pages_viewed`（manifest 中全部板页的顺序列表）、`board_reviewed_frame_indices`（全部板上源帧）、`native_resolution_verified=true`。`viewed_frame_indices` 可以包含实际看过的板上帧；`original_frames_opened` 与 `initial_evidence_frame_indices` 只记录单独打开的原图。反证中的“新帧”必须是初审原图和局部板都未看过的帧，不能换一种展示方式就当成新证据。
+
+持续支撑、静止或匀速阶段通过全片概览追踪；在接触建立、调整、分离、遮挡变化或异常处建立严格窗口，不要机械按每2秒把整片重复审核。共享画面可服务多个动作，但每个动作的实体、判断与证据引用仍分别绑定。
 
 连续性板只用于并排定位，最多 2×2。manifest 必须保存时间区间、ROI、网格、原始尺寸、源帧号、板路径和 SHA-256。全片概览板不能证明局部一致性。对象离开 ROI 时扩大 ROI 或使用全帧；遮挡不能自动解释去向。
 
