@@ -76,11 +76,21 @@ class StagedReviewTests(unittest.TestCase):
             "observation": "Checked from original frames.",
             "frame_indices": [1, 2, 3, 4] if name == "motion_force_causality" else [],
             "strongest_counterexample": "No unexplained reversal found." if name == "motion_force_causality" else None,
+            "evidence_basis": "direct_visible" if name == "motion_force_causality" else "not_relevant",
+            "scope_reason": "Not needed for this isolated translation check.",
+            "assessed_entity_ids": ["person_1", "cup_1"],
+            "observable_criterion": "The hand and supported cup move upward together after contact.",
+            "alternative_explanations": {"normal_explanation": "Rigid translation with the hand",
+                                         "anomaly_explanation": "Cup moves before contact",
+                                         "discriminating_observation": "Inspect contact at frames 2 and 3"},
         } for name in STATE_DIMENSIONS]
 
     def make_initial(self):
         return {
             "transition_id": "T1", "requirement_id": "R1",
+            "action_binding": {"subject_id": "person_1", "predicate": "lift", "object_id": "cup_1"},
+            "part_inventory": {"mode": "whole_entity", "part_ids": [],
+                               "reason": "This window tests translation of a rigid cup without a connection change."},
             "source_interval_sec": [0.1, 0.4], "source_frame_indices": [1, 2, 3, 4],
             "board_manifest_path": str(self.board.resolve()),
             "before_frame_index": 1, "during_frame_indices": [2, 3], "after_frame_index": 4,
@@ -91,7 +101,9 @@ class StagedReviewTests(unittest.TestCase):
                 "entity_id": "cup_1", "before_state": "on table", "during_state": "in hand",
                 "after_state": "above table", "allowed_changes": ["position"],
                 "actual_changes": ["position"], "status": "tracked",
-            }],
+            }, {"entity_id": "person_1", "before_state": "hand approaches cup", "during_state": "hand grips cup",
+                "after_state": "hand supports cup", "allowed_changes": ["pose"],
+                "actual_changes": ["pose"], "status": "tracked"}],
             "dimension_checks": self.dimensions(),
             "strongest_counterexamples": ["Identity replacement was searched and not observed."],
             "initial_verdict": "confirmed_consistent",
@@ -174,6 +186,7 @@ class StagedReviewTests(unittest.TestCase):
         challenge = {"challenge_reviews": [{
             "transition_id": "T1", "method": "self_blind", "verdict": "confirmed_consistent",
             "observation": "Tighter crop retains the same entity.", "frame_indices": [1, 2, 3, 4],
+            "reviewed_entity_ids": ["person_1", "cup_1"],
             "board_manifest_path": str(challenge_board.resolve()),
         }]}
         self.assertEqual(validate_challenge(challenge, {"state_transition_checks": [self.initial_check]}), [])

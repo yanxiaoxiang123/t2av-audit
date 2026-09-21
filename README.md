@@ -30,6 +30,8 @@ $PYTHON scripts/analyze_audio.py /absolute/video.mp4 --output-dir /absolute/vide
 
 The reviewing model must actually inspect every required source frame. Build `draft.json` only from the frozen checkpoints, render and review annotations, then finalize it:
 
+Transition records must bind observations to the current action's actor and target, track distinguishable parts with visual anchors, and support occlusion explanations with explicit evidence. Invisible internal mechanisms alone do not justify a defect or uncertainty score cap. These contracts are enforced when freezing the initial review and rechecked during finalization.
+
 ```bash
 $PYTHON scripts/review_result.py render /absolute/run/draft.json
 $PYTHON scripts/review_result.py finalize /absolute/run/draft.json --boxes-reviewed

@@ -38,6 +38,25 @@
 
 ## 4. 冻结初审与自盲反证
 
+### 动作、部件和可观察性合同
+
+每个 transition 增加 `action_binding`，其 `subject_id / predicate / object_id` 必须与冻结命题完全一致。账本必须包含动作双方；检查当前动作的接触、因果、空间绑定时，`assessed_entity_ids` 必须覆盖双方。另一主体的支撑、背景稳定、没有悬浮，都不能代替当前操作的判断。
+
+`part_inventory` 明确选择 `decomposed` 或 `whole_entity`，填写 `reason` 和 `part_ids`。涉及可分辨部件的连接、分离、数量或轮廓变化时必须拆分：每个部件单独建立实体 ID、`parent_id`，用 `visual_anchors` 记录 before/during/after 的 `frame_index / feature / phase`。固定可见端点、连接处、边缘或纹理特征，不能仅给整个对象起名后把不同轮廓统一称为“同一物体”。无可分辨部件的刚体移动或连续介质可以选 whole_entity，说明理由；不凭常识虚构不可见结构。
+
+维度项增加 `assessed_entity_ids / observable_criterion / evidence_basis`。`observable_criterion` 必须回答当前动作究竟要验证什么，而非复述“检查是否异常”。`evidence_basis` 为：
+
+- `direct_visible`：直接观察可见接触、形状或运动。
+- `external_proxy`：外部可见证据支持某状态，补充 `proxy_link` 说明因果联系及限度。不能仅凭最终成功证明整个过程。
+- `unobservable_internal`：内部机构本来不可见；该内部子问题标 not_applicable 并填写 `scope_reason`，不要因此认定缺陷或不确定。仍需另外检查可见动作，不得借此排除整项物理检查。
+- `not_relevant`：维度与当前动作无关，填写具体 `scope_reason`。
+
+任何 uncertain/defect 维度需填写 `alternative_explanations`：`normal_explanation / anomaly_explanation / discriminating_observation`。必须具体比较正常透视、遮挡或运动解释与异常解释，说明哪张原图上什么事实能区分它们。存在不能解释的可见变化时，不得只写“遮挡不清”；仅凭内部不可见也不能推断失败。校验器只验证记录约束，无法证明这些解释在视觉上正确。
+
+账本实体标 `occluded` 时需 `occlusion_account`：`occluder_id / frame_indices / visible_before / visible_after / predicted_reappearance / outcome`。遮挡者必须在账本中，outcome 为 supported、contradicted 或 unresolved；contradicted 应改记 unexplained。即使仅能保留 uncertain，也要指明尚未解决的部件对应，不能用“环件/物件重叠”代替定位。
+
+反证必须填 `reviewed_entity_ids`，覆盖动作双方及全部已登记部件；不确定或缺陷的 `dimension_findings` 使用同样的维度证据合同。紧裁剪之外仍需核对原全帧，避免裁掉原部件后误认消失。复核重点是比较上述两种解释，不是重复初审用词。
+
 初审文件只含观察、实体账本、维度结果和 `initial_verdict`，不含分数。冻结后才开始反证。
 
 同一审核者的自盲反证必须满足至少一项：

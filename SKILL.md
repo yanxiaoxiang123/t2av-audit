@@ -27,4 +27,6 @@ Before working, read:
 
 Never use a successful end state to dismiss an unexplained intermediate state. If a critical entity or part cannot be continuously matched, return `uncertain` or `confirmed_defect`; do not declare consistency. A validator pass proves structural and provenance consistency only, not pixel semantics.
 
+For every transition, bind the judgment to the frozen action's actor and target. Track distinguishable parts and their visible features separately when connection or shape changes matter. Compare normal motion/occlusion with an anomaly using concrete observations. An invisible internal mechanism alone is not a defect or a reason to cap scores: assess the visible interaction and state changes requested by the Prompt. See the action-evidence contract in the state-transition protocol before freezing initial or challenge findings.
+
 Return the final JSONL path, evidence directory, metric summary, and any unresolved limits. A failed stage, unavailable visual inspection, or failed finalizer means the audit is incomplete.

@@ -47,6 +47,16 @@
 
 实体 `status` 为 `tracked / occluded / unexplained`。维度及状态见 [state_transition_protocol.md](state_transition_protocol.md)。
 
+动作证据必填扩展：
+
+- transition：`action_binding={subject_id,predicate,object_id}`；`part_inventory={mode,reason,part_ids}`。
+- 拆分部件账本：`parent_id`、`visual_anchors=[{phase,frame_index,feature}]`，覆盖 before/during/after。
+- 遮挡实体：`occlusion_account={occluder_id,frame_indices,visible_before,visible_after,predicted_reappearance,outcome}`。
+- 每维：`evidence_basis`；适用项还需 `assessed_entity_ids / observable_criterion`，外部代理证据需 `proxy_link`，不适用项需 `scope_reason`。
+- 不确定/缺陷维度：`alternative_explanations={normal_explanation,anomaly_explanation,discriminating_observation}`。
+
+枚举值、适用条件和视觉判断边界详见状态转换协议中的“动作、部件和可观察性合同”。旧版冻结记录缺少这些字段时不再通过。
+
 ## 3. 冻结反证 `CHALLENGE.json`
 
 ```json
@@ -65,6 +75,8 @@
 ```
 
 每个初审 transition 恰好一项。`frame_indices` 至少含初审未使用的新帧，或 `board_manifest_path` 指向严格更紧的新 ROI 板。
+
+每项还需 `reviewed_entity_ids`，包含初审 action_binding 的双方和 part_inventory 的全部部件；反证维度发现也必须填写动作证据扩展字段。
 
 反证发现缺陷或不确定性时，还必须填写非空 `dimension_findings[]`，每项含 `dimension / status / observation / frame_indices`，状态为 `applicable_defect` 或 `applicable_uncertain`。这些冻结发现参与最终评分传播，不改写初审记录。
 

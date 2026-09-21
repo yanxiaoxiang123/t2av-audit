@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import sys
+from action_evidence import validate_action_evidence
 
 from workflow_common import (
     INITIAL_REQUIRED_FIELDS, PHYSICAL_CLAIM_TYPES, STATE_DIMENSIONS, VERDICTS,
@@ -127,6 +128,8 @@ def validate_initial(value, plan, pts):
         if rid not in strict_requirements:
             errors.append(f"{label}: requirement_id is not a strict physical action")
         covered.add(rid)
+        requirement = next((r for r in plan["prompt_checks"] if r["requirement_id"] == rid), {})
+        errors.extend(f"{label}: {message}" for message in validate_action_evidence(check, requirement))
         interval = check["source_interval_sec"]
         if (not isinstance(interval, list) or len(interval) != 2 or
                 not all(type(x) in (int, float) and math.isfinite(x) for x in interval) or
@@ -232,11 +235,22 @@ def validate_challenge(value, initial):
             errors.append(f"{label}: frame_indices must be a nonempty integer array")
             continue
         original = initial_map[tid]
+        binding = original.get("action_binding", {})
+        required_entities = {binding.get("subject_id"), binding.get("object_id")} - {None}
+        required_entities.update(original.get("part_inventory", {}).get("part_ids", []))
+        reviewed = review.get("reviewed_entity_ids")
+        if (not isinstance(reviewed, list) or any(not isinstance(e, str) for e in reviewed) or
+                not required_entities <= set(reviewed)):
+            errors.append(f"{label}: challenge must revisit action participants and inventoried parts")
         if review.get("verdict") in {"confirmed_defect", "uncertain"}:
             findings = review.get("dimension_findings")
             if not isinstance(findings, list) or not findings:
                 errors.append(f"{label}: adverse challenge requires dimension_findings")
             else:
+                scoped = dict(original, dimension_checks=findings, initial_evidence_frame_indices=frames)
+                # Ledger anchors retain initial evidence; include those frames for ledger validation.
+                scoped["initial_evidence_frame_indices"] = sorted(set(frames) | set(original.get("initial_evidence_frame_indices", [])))
+                errors.extend(f"{label}: {message}" for message in validate_action_evidence(scoped, binding))
                 for finding in findings:
                     if (not isinstance(finding, dict) or finding.get("dimension") not in STATE_DIMENSIONS or
                             finding.get("status") not in {"applicable_defect", "applicable_uncertain"} or
