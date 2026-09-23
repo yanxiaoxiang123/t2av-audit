@@ -4,7 +4,7 @@
 
 ## 1. 冻结原子要求
 
-`prompt_checks` 中每条记录只能表达一个可验证命题。动作、属性、数量、空间关系、文字、对白、声音和时序分别建项；多个动作即使出现在同一句 Prompt 中也必须拆开。
+`prompt_checks` 中每条记录只能表达一个可验证命题。动作、属性、数量、空间关系、文字、对白内容、声音存在、对白/音乐时序和声画绑定分别建项；多个动作即使出现在同一句 Prompt 中也必须拆开。比如“说出这句台词”和“在 Shot 1 说出”应拆成内容检查与镜头绑定检查，避免 onset 估计冲突污染台词可辨性结论。
 
 每项包含：`requirement_id`、`claim_type`、稳定的 `subject_id`、单一 snake_case `predicate`、可空 `object_id`、`expected_before`、`expected_after`、`sequence_index`、精确的 `prompt_span` 和 `prompt_quote`、`metric_ids`。物理动作使用 `physical_action`，手物动作使用 `human_object_action`，并设置 `strict_transition_required=true`。
 

@@ -13,7 +13,11 @@ import re
 import sys
 import wave
 from inspection_coverage import inspection_frames
-from audio_review import compare as compare_audio_reviews
+from audio_review import (
+    TIMING_CONFLICTS, compare as compare_audio_reviews,
+    compare_detailed as compare_audio_reviews_detailed, fulfillment as audio_fulfillment,
+    is_audio_claim, requires_visual_binding,
+)
 
 from workflow_common import (
     DIMENSION_ISSUE_CATEGORY, ISSUE_METRICS, PHYSICAL_CLAIM_TYPES, SEVERITY_CAPS,
@@ -381,7 +385,7 @@ def validate_state_transitions(checks, evidence, metric_items, inspection, frame
 
 def validate_audio_boundaries(checks, metric_items, err):
     metric_map = {item.get("metric_id"): item for item in metric_items}
-    explicit_af = any(check.get("claim_type") == "audio" and "AF" in (check.get("metric_ids") or [])
+    explicit_af = any(is_audio_claim(check) and "AF" in (check.get("metric_ids") or [])
                       for check in checks)
     af_metric = metric_map.get("AF", {})
     if not explicit_af and af_metric.get("status") == "已评分" and af_metric.get("score") != 5:
@@ -407,7 +411,11 @@ def validate_requirement_audio_result(record, review_dir, prepared, checks, metr
             sha256(plan_path) != frozen_sha):
         err("references", "Audio requirement result does not match the video and frozen plan")
         return
-    audio_checks = {x.get("requirement_id"): x for x in checks if x.get("claim_type") == "audio"}
+    contract_version = result.get("contract_version", 1)
+    if type(contract_version) is not int or contract_version not in {1, 2, 3}:
+        err("references", "Audio requirement result has an unsupported contract version")
+        return
+    audio_checks = {x.get("requirement_id"): x for x in checks if is_audio_claim(x)}
     entries = result.get("requirements")
     if (not isinstance(entries, list) or len(entries) != len(audio_checks) or
             len({x.get("requirement_id") for x in entries if isinstance(x, dict)}) != len(entries)):
@@ -424,36 +432,152 @@ def validate_requirement_audio_result(record, review_dir, prepared, checks, metr
         elif sha256(Path(path_value)) != segment.get("audio_sha256"):
             err("files", "Audio requirement WAV hash mismatch")
     uncertain_ids = set()
+    binding_uncertain_ids = set()
+    evidence_map = {x.get("evidence_id"): x for x in evidence if isinstance(x, dict)}
     for rid, entry in mapped.items():
         check = audio_checks[rid]
-        status = entry.get("status")
+        status = entry.get("audibility_status", entry.get("status"))
+        if contract_version >= 3 and (entry.get("status") != status or entry.get("audibility_status") != status):
+            err("scores", f"{rid}: status and audibility_status must match")
+        if contract_version >= 3 and entry.get("visual_binding_required") is not requires_visual_binding(entry):
+            err("scores", f"{rid}: visual_binding_required differs from the frozen claim")
         if entry.get("full_review") is not None:
             try:
-                expected_status, expected_conflicts = compare_audio_reviews(
-                    entry["full_review"], entry["local_reviews"], bool(entry["local_reviews"]))
-                if status != expected_status or entry.get("conflicts") != expected_conflicts:
-                    err("scores", f"{rid}: audio verdict differs from saved full/local reviews")
+                if contract_version >= 3:
+                    expected_status, expected_conflicts, expected_timing, expected_estimates = compare_audio_reviews_detailed(
+                        entry["full_review"], entry["local_reviews"],
+                        bool(entry.get("coverage_complete")), entry)
+                    if (status != expected_status or entry.get("conflicts") != expected_conflicts or
+                            entry.get("timing_status") != expected_timing or
+                            entry.get("timing_estimates") != expected_estimates):
+                        err("scores", f"{rid}: audio audibility/timing result differs from saved full/local reviews")
+                else:
+                    expected_status, expected_conflicts = compare_audio_reviews(
+                        entry["full_review"], entry["local_reviews"], bool(entry["local_reviews"]), entry)
+                    if status != expected_status or entry.get("conflicts") != expected_conflicts:
+                        err("scores", f"{rid}: audio verdict differs from saved full/local reviews")
             except (KeyError, TypeError, ValueError):
                 err("scores", f"{rid}: invalid full/local audio reviews")
+        elif result.get("source", {}).get("has_audio_stream"):
+            err("scores", f"{rid}: audio stream requires a saved full/local analysis")
         if entry.get("prompt_quote") != check.get("prompt_quote"):
             err("references", f"{rid}: audio quote differs from frozen plan")
         if status not in {"confirmed_present", "confirmed_absent", "uncertain", "analysis_failed"}:
             err("scores", f"{rid}: invalid audio verdict")
             continue
-        if status in {"uncertain", "analysis_failed"}:
+        fulfillment = entry.get("fulfillment", "uncertain")
+        if contract_version >= 3:
+            try:
+                expected_fulfillment = audio_fulfillment(entry, status, entry.get("full_review") or {})
+                if fulfillment != expected_fulfillment:
+                    err("scores", f"{rid}: audio fulfillment differs from its status and full review")
+            except (KeyError, TypeError, ValueError):
+                err("scores", f"{rid}: invalid audio fulfillment inputs")
+        if status in {"uncertain", "analysis_failed"} or fulfillment == "uncertain":
             uncertain_ids.add(rid)
             if check.get("status") != "无法判断":
                 err("scores", f"{rid}: unresolved audio cannot be called absent or present")
-        elif status == "confirmed_present" and check.get("status") in {"未呈现", "与要求矛盾"}:
+        elif status == "confirmed_present" and fulfillment == "violated" and check.get("status") in {"已呈现", "未呈现", "部分呈现"}:
+            err("scores", f"{rid}: audible event does not satisfy its count/prohibition constraint")
+        elif status == "confirmed_present" and fulfillment == "satisfied" and check.get("status") in {"未呈现", "与要求矛盾"}:
             err("scores", f"{rid}: audible requirement cannot be called missing")
         elif status == "confirmed_absent" and check.get("status") in {"已呈现", "部分呈现"}:
             err("scores", f"{rid}: absent audio cannot be called present")
-        if entry.get("conflicts") and status != "uncertain":
-            err("scores", f"{rid}: audio conflict must remain uncertain")
+        semantic_conflicts = [x for x in entry.get("conflicts", []) if x not in TIMING_CONFLICTS]
+        if contract_version >= 3:
+            if semantic_conflicts and status not in {"uncertain", "analysis_failed"}:
+                err("scores", f"{rid}: content/count conflict must remain uncertain")
+            if entry.get("timing_conflicts") != [x for x in entry.get("conflicts", []) if x in TIMING_CONFLICTS]:
+                err("scores", f"{rid}: timing_conflicts do not match conflict records")
+        elif entry.get("conflicts") and status != "uncertain":
+            err("scores", f"{rid}: legacy audio conflicts must remain uncertain")
+
+        if contract_version >= 3 and entry.get("visual_binding_required"):
+            binding = check.get("audio_binding")
+            if check.get("status") == "无法判断":
+                binding_uncertain_ids.add(rid)
+            if not isinstance(binding, dict) and check.get("status") != "无法判断":
+                err("scores", f"{rid}: shot-bound audio claim needs an audio_binding record")
+                binding_uncertain_ids.add(rid)
+            elif isinstance(binding, dict):
+                binding_status = binding.get("status")
+                if binding_status not in {"consistent", "conflict", "uncertain"} or not str(binding.get("reason", "")).strip():
+                    err("scores", f"{rid}: audio_binding needs a supported status and reason")
+                    binding_uncertain_ids.add(rid)
+                if binding_status == "uncertain":
+                    binding_uncertain_ids.add(rid)
+                    if check.get("status") != "无法判断":
+                        err("scores", f"{rid}: uncertain audio binding must remain unresolved")
+                elif binding_status == "consistent" and check.get("status") not in {"已呈现", "部分呈现"}:
+                    err("scores", f"{rid}: consistent audio binding is not reflected in prompt check")
+                elif binding_status == "conflict" and check.get("status") not in {"与要求矛盾", "部分呈现"}:
+                    err("scores", f"{rid}: conflicting audio binding is not reflected in prompt check")
+                interval = binding.get("visual_interval_sec")
+                duration = prepared["media_metadata"].get("duration_sec")
+                valid_visual_interval = (
+                    isinstance(interval, list) and len(interval) == 2 and
+                    all(type(x) in (int, float) and math.isfinite(x) for x in interval) and
+                    type(duration) in (int, float) and 0 <= interval[0] < interval[1] <= duration
+                )
+                if not valid_visual_interval:
+                    err("scores", f"{rid}: audio_binding visual interval is invalid")
+                estimate_times = (entry.get("timing_estimates") or {}).get("all_source_times_sec", [])
+                supplied_times = binding.get("audio_time_estimates_sec", [])
+                if (binding_status in {"consistent", "conflict"} and
+                        (not isinstance(supplied_times, list) or not supplied_times)):
+                    err("scores", f"{rid}: resolved audio binding needs at least one saved time estimate")
+                if (not isinstance(supplied_times, list) or not isinstance(estimate_times, list) or
+                        any(type(x) not in (int, float) or not math.isfinite(x) or
+                            not any(abs(x - y) <= 1e-6 for y in estimate_times) for x in supplied_times)):
+                    err("scores", f"{rid}: audio_binding times must cite saved source-time estimates")
+                binding_refs = binding.get("evidence_ids") or []
+                check_refs = check.get("evidence_ids") or []
+                if (not isinstance(binding_refs, list) or not binding_refs or
+                        not all(isinstance(ref, str) for ref in binding_refs) or
+                        not isinstance(check_refs, list) or not all(isinstance(ref, str) for ref in check_refs) or
+                        not set(binding_refs) <= set(check_refs) or
+                        any(ref not in evidence_map for ref in binding_refs)):
+                    err("references", f"{rid}: audio_binding must reference the check's saved evidence")
+                else:
+                    cited = [evidence_map[ref] for ref in binding_refs]
+                    if not any(e.get("frames") for e in cited) or not any(e.get("audio_segments") for e in cited):
+                        err("scores", f"{rid}: audio_binding evidence needs both visual frames and WAV context")
+                    if any(rid not in (e.get("requirement_ids") or []) for e in cited):
+                        err("references", f"{rid}: audio_binding evidence must cite this requirement")
+                    expected_audio_paths = {
+                        row.get("audio_path") for row in
+                        [entry.get("full_review") or {}, *(entry.get("local_reviews") or [])]
+                        if isinstance(row, dict) and isinstance(row.get("audio_path"), str)
+                    }
+                    cited_audio = [audio for e in cited for audio in e.get("audio_segments") or []
+                                   if isinstance(audio, dict) and audio.get("audio_path") in expected_audio_paths]
+                    cited_audio_paths = {audio.get("audio_path") for audio in cited_audio}
+                    if not expected_audio_paths.intersection(cited_audio_paths):
+                        err("references", f"{rid}: audio_binding WAV must belong to this requirement result")
+                    if (not valid_visual_interval or not any(
+                            type(frame.get("time_sec")) in (int, float) and
+                            interval[0] <= frame["time_sec"] <= interval[1]
+                            for e in cited for frame in e.get("frames") or [])):
+                        err("references", f"{rid}: audio_binding needs a cited frame in its visual interval")
+                    if supplied_times and not any(
+                            type(audio.get("source_start_time_sec")) in (int, float) and
+                            type(audio.get("source_end_time_sec")) in (int, float) and
+                            audio["source_start_time_sec"] <= estimate <= audio["source_end_time_sec"]
+                            for estimate in supplied_times for audio in cited_audio):
+                        err("references", f"{rid}: audio_binding times must fall in a cited requirement WAV")
+                    if (binding_status == "consistent" and valid_visual_interval and
+                            isinstance(supplied_times, list) and
+                            any(type(estimate) in (int, float) and
+                                not interval[0] <= estimate <= interval[1] for estimate in supplied_times)):
+                        err("scores", f"{rid}: consistent audio binding has an onset outside its visual interval")
     for metric in metric_items:
         if metric.get("metric_id") in AUDIO_METRICS and uncertain_ids.intersection(metric.get("requirement_ids") or []):
             if metric.get("confidence") != "低" or not metric.get("uncertainty"):
                 err("scores", f"{metric.get('metric_id')}: unresolved audio needs low confidence and uncertainty")
+        timing_sensitive = metric.get("metric_id") in {"AF", "AV", "MU", "SB", "TS"}
+        if timing_sensitive and binding_uncertain_ids.intersection(metric.get("requirement_ids") or []):
+            if metric.get("confidence") != "低" or not metric.get("uncertainty"):
+                err("scores", f"{metric.get('metric_id')}: unresolved audio binding needs low confidence and uncertainty")
     for ev in evidence:
         for sync in ev.get("synchronization") or []:
             if sync.get("offset_sec") is None:
@@ -463,12 +587,50 @@ def validate_requirement_audio_result(record, review_dir, prepared, checks, metr
             uncertainty = sync.get("time_uncertainty_sec")
             if not entry or entry.get("status") != "confirmed_present":
                 err("scores", f"{ev.get('evidence_id')}: numeric AV offset needs confirmed audio requirement")
+            if (entry and contract_version >= 3 and entry.get("timing_status") == "conflict" and
+                    sync.get("independent_measurement") is not True):
+                err("scores", f"{ev.get('evidence_id')}: conflicting model times need an independent measurement")
+            if (entry and contract_version >= 3 and
+                    "gemini" in str(sync.get("measurement_method", "")).lower()):
+                err("scores", f"{ev.get('evidence_id')}: numeric AV offset cannot use Gemini time estimates")
             if (type(uncertainty) not in (int, float) or not math.isfinite(uncertainty) or
                     uncertainty <= 0 or uncertainty > 0.1):
                 err("scores", f"{ev.get('evidence_id')}: AV offset lacks sufficient time precision")
             if (not sync.get("measurement_method") or sync.get("visual_onset_sec") is None or
                     sync.get("audio_onset_sec") is None or sync.get("audio_requirement_id") != rid):
                 err("scores", f"{ev.get('evidence_id')}: AV offset lacks traceable common-timeline timing")
+            if rid and entry:
+                if rid not in (ev.get("requirement_ids") or []):
+                    err("references", f"{ev.get('evidence_id')}: AV evidence does not cite its audio requirement")
+                check = audio_checks.get(rid)
+                binding = check.get("audio_binding") if check else None
+                if (contract_version >= 3 and
+                        (not isinstance(binding, dict) or binding.get("status") == "uncertain" or
+                         (check and check.get("status") == "无法判断"))):
+                    err("scores", f"{ev.get('evidence_id')}: numeric AV offset needs a resolved visual binding")
+                if contract_version >= 3:
+                    audio_onset = sync.get("audio_onset_sec")
+                    visual_onset = sync.get("visual_onset_sec")
+                    requirement_paths = {
+                        row.get("audio_path") for row in
+                        [entry.get("full_review") or {}, *(entry.get("local_reviews") or [])]
+                        if isinstance(row, dict) and isinstance(row.get("audio_path"), str)
+                    }
+                    audio_segments = [segment for segment in ev.get("audio_segments") or []
+                                      if segment.get("audio_path") in requirement_paths]
+                    valid_audio_onset = (type(audio_onset) in (int, float) and math.isfinite(audio_onset))
+                    valid_visual_onset = (type(visual_onset) in (int, float) and math.isfinite(visual_onset))
+                    if (not valid_audio_onset or not any(
+                            type(segment.get("source_start_time_sec")) in (int, float) and
+                            type(segment.get("source_end_time_sec")) in (int, float) and
+                            segment["source_start_time_sec"] <= audio_onset <= segment["source_end_time_sec"]
+                            for segment in audio_segments)):
+                        err("references", f"{ev.get('evidence_id')}: measured audio onset is outside cited requirement WAVs")
+                    if (not valid_visual_onset or not any(
+                            type(frame.get("time_sec")) in (int, float) and
+                            abs(frame["time_sec"] - visual_onset) <= .25
+                            for frame in ev.get("frames") or [])):
+                        err("references", f"{ev.get('evidence_id')}: measured visual onset is not tied to a cited source frame")
 
 
 def validate(record, review_dir, boxes_reviewed):

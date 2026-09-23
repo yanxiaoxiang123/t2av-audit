@@ -126,11 +126,13 @@
 
 `audio_segments[]` 包含：`audio_path / source_start_time_sec / source_end_time_sec / sample_rate_hz / channels / heard_content / verified_by_listening`。未亲听的 Gemini 证据在 evidence 层填写 `analysis_method="gemini_audio_understanding" / analysis_result_path / analysis_model`。
 
-新审核若存在 `RUN/audio/requirements/audio_requirements.json`，finalizer 会把其中逐项结论与冻结计划、最终 `prompt_checks` 比对。每项 `status` 为 `confirmed_present / confirmed_absent / uncertain / analysis_failed`，另有 `fulfillment=satisfied / violated / uncertain` 表示 Prompt 的数量或禁止条件是否满足；后两者对应 `无法判断`。`conflicts` 非空的要求不得写成确定结论。旧审核没有该文件时沿用原校验规则。音频指标若引用未解决要求，`confidence` 为 `低` 且 `uncertainty` 非空。
+新审核若存在 `RUN/audio/requirements/audio_requirements.json`，finalizer 会把其中逐项结论与冻结计划、最终 `prompt_checks` 比对。Contract 3 新增 `audibility_status`（`confirmed_present / confirmed_absent / uncertain / analysis_failed`），`status` 保留同值作为兼容别名；`fulfillment=satisfied / violated / uncertain` 只表示音频侧的存在、数量或禁令条件，不表示镜头绑定。`timing_status` 为 `conflict / estimated / not_reported / not_applicable`，并通过 `timing_estimates` 保存全段与局部源时间估计；全段和局部所报的具体 `sound_class` 不一致、数量不一致或声音存在性矛盾属于内容争议；全段/局部或重叠局部之间的时间估计冲突可以和 `confirmed_present` 同时出现。时间冲突阈值为 `max(0.5 秒, 双方报告的不确定度之和)`。`visual_binding_required/status` 与 `visual_binding_queue` 提醒后续把音频估计和视觉切点分开核对。未解决的类别、计数、遮蔽或存在性冲突须保持 `uncertain`；旧 Contract 2 文件沿用旧聚合状态校验。
 
-音频要求可选填在冻结计划项的 `audio_spec` 中：`polarity=required|forbidden`、`event_kind=discrete|continuous|unknown`、`expected_count`、`target`、`search_interval_sec`。缺省时仍按可听见的必需声音处理。每个 WAV 段保存请求 JSON、响应 JSON、源区间、SHA-256 和 PCM 方法；PCM 峰值只用于候选窗口。
+最终 `prompt_checks[]` 对已判定的镜头绑定可选填 `audio_binding`：`status=consistent|conflict|uncertain`、`audio_time_estimates_sec[]`、`visual_interval_sec[2]`、`reason`、`evidence_ids[]`。估计来源必须能追溯到该要求的 WAV 结果，引用证据必须同时包含音频片段与视觉帧。存在时间冲突时，只有独立于 Gemini 估计的测量才能支持数值 AV offset（同步记录填写 `independent_measurement=true`）；否则 offset 为 null。未解决的绑定要求保持 `无法判断`，相关 AV/时序指标低置信并填写限制。
 
-`synchronization[]` 包含：`event_label / visual_onset_sec / audio_onset_sec / visual_peak_sec / audio_peak_sec / visual_end_sec / audio_end_sec / offset_sec / measurement_method / time_uncertainty_sec`。
-新音频证据启用时，非空 `offset_sec` 另需 `audio_requirement_id` 指向已确认存在的声音，且同源时间轴总不确定度不超过 0.1 秒；不满足时填 null。模型估计时间本身不构成精确同步测量。
+音频要求可选填在冻结计划项的 `audio_spec` 中：`polarity=required|forbidden`、`event_kind=discrete|continuous|unknown`、`expected_count`、`target`、`search_interval_sec`。缺省时仍按可听见的必需声音处理。WAV 逐项复核记录的 `sound_class` 使用 `speech / music / ambience / impulse / gunshot / explosion / metallic_impact / glass_break / footstep / vocalization / mechanical / vehicle / water / weather / generic_impact / other / unknown`；枪响、金属撞击等特定目标若只辨识到泛化瞬态类别，结论降为 `uncertain`；全段与局部都给出不同的具体类别时生成类别冲突。每个 WAV 段保存请求 JSON、响应 JSON、源区间、SHA-256 和 PCM 方法；PCM 峰值只用于候选窗口。`listening_queue[]` 保持逐要求逐 WAV 记录并带 `priority`，`listening_clips[]` 将相同 WAV 合并并汇总要求 ID 与冲突原因。
+
+`synchronization[]` 包含：`event_label / visual_onset_sec / audio_onset_sec / visual_peak_sec / audio_peak_sec / visual_end_sec / audio_end_sec / offset_sec / measurement_method / time_uncertainty_sec / audio_requirement_id / independent_measurement`。
+新音频证据启用时，非空 `offset_sec` 另需 `audio_requirement_id` 指向已确认存在的声音，音频起点须落在同一要求引用的 WAV 源区间内，视觉起点须有 0.25 秒内的引用源帧支持，且同源时间轴总不确定度不超过 0.1 秒；若 Gemini 时间互相冲突，须有独立测量 (`independent_measurement=true`)。不满足时填 null。模型估计时间本身不构成精确同步测量。
 
 所有路径均为可重新打开的绝对路径；帧 PTS、路径和尺寸必须与提取 manifest 相同。不存在对象时使用 `search_area`，不能虚构对象框。

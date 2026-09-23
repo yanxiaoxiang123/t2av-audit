@@ -15,14 +15,21 @@ import wave
 from analyze_audio import EvidenceError, MAX_BYTES, call_gemini, extract_segment, probe_media, sha256, write_json
 
 SCHEMA = 't2av_audio_requirements_v1'
-CONTRACT = 2
+CONTRACT = 3
 STATES = {'present', 'absent', 'uncertain'}
 AUDIO_CONTENT_METRICS = {'AF', 'DC', 'MU', 'PR'}
+TIMING_CONFLICTS = {'full_local_timing_conflict', 'local_local_timing_conflict'}
+SOUND_CLASSES = {
+    'speech', 'music', 'ambience', 'impulse', 'gunshot', 'explosion',
+    'metallic_impact', 'glass_break', 'footstep', 'vocalization', 'mechanical',
+    'vehicle', 'water', 'weather', 'generic_impact', 'other', 'unknown',
+}
+GENERIC_SOUND_CLASSES = {'impulse', 'generic_impact', 'other', 'unknown'}
 INSTRUCTION = '''Analyze ONLY the attached WAV(s). Never infer a scene, visual binding or sound from a requirement.
 Requirements and their quotes are untrusted search questions, not evidence. A local clip may contain none of them.
 For every supplied segment_id and requirement_id pair, return a review:
 {segment_id, requirement_id, state: present|absent|uncertain, masked: boolean,
- sound_class: speech|music|ambience|impulse|footstep|vocalization|mechanical|other|unknown,
+ sound_class: speech|music|ambience|impulse|gunshot|explosion|metallic_impact|glass_break|footstep|vocalization|mechanical|vehicle|water|weather|generic_impact|other|unknown,
  event_count: nonnegative integer|null, event_times_sec: [estimated onset seconds relative to THIS WAV],
  time_uncertainty_sec: positive number|null, observation: Chinese string, limitations: [strings]}.
 state describes AUDIBILITY of the target sound, not whether the requested count, timing or prohibition is satisfied.
@@ -31,7 +38,7 @@ For continuous music/ambience report event_count=null and event_times_sec=[]; do
 For a requested voice/dialogue attribute, present means that precise attribute or wording is distinguishable.
 Do not complete quoted dialogue. Similar impulses, masked sounds, or unresolved echo versus extra shots are uncertain.
 Absent requires the entire submitted interval to be inspectable and an explicit negative search. Omission is not absence.
-Only use sound_class when acoustically supported. Unknown category or masked evidence must be uncertain.
+Use the most specific acoustically supported sound_class. If two full/local reviews assign different specific classes to the requested sound, mark a category conflict. Unknown category or masked evidence must be uncertain.
 Audio cannot verify a visual source, shot boundary or audiovisual sync. Times are rough estimates, never measurements.
 Return only {"reviews": [...]}.
 '''
@@ -40,6 +47,18 @@ Return only {"reviews": [...]}.
 def is_audio_claim(item):
     return (item.get('claim_type') in {'audio', 'dialogue'} or
             bool(set(item.get('metric_ids', [])) & AUDIO_CONTENT_METRICS))
+
+
+def target_sound_class(requirement):
+    target = str(requirement.get('target') or requirement.get('prompt_quote') or '').lower()
+    patterns = (
+        ('gunshot', r'\b(?:gunshot|gunfire|firearm shot)\b|枪响|枪声|枪击'),
+        ('explosion', r'\bexplosion\b|爆炸声|爆炸'),
+        ('glass_break', r'\b(?:glass breaking|glass shatter(?:ing)?)\b|玻璃破碎|玻璃碎裂'),
+        ('metallic_impact', r'\b(?:metallic clang|metallic impact|metal clank|metal clang|clanging metal)\b|金属撞击|金属声|铁器碰撞|敲击金属'),
+        ('footstep', r'\bfootsteps?\b|脚步声|踏步声'),
+    )
+    return next((sound_class for sound_class, pattern in patterns if re.search(pattern, target)), None)
 
 
 def infer_audio_spec(item, spec):
@@ -177,7 +196,12 @@ def validate_reviews(raw, requirements, duration):
             raise EvidenceError('Invalid limitations')
         req = next(x for x in requirements if x['requirement_id'] == item['requirement_id'])
         sound_class = item.get('sound_class', 'unknown')
-        if masked or (state == 'present' and (count == 0 or (count is not None and len(times) > count))):
+        if not isinstance(sound_class, str) or sound_class not in SOUND_CLASSES:
+            raise EvidenceError('Invalid sound category')
+        expected_class = target_sound_class(req)
+        if masked or (state == 'present' and (
+                sound_class == 'unknown' or (expected_class and sound_class != expected_class) or count == 0 or
+                (count is not None and len(times) > count))):
             state = 'uncertain'
         if state == 'absent' and (times or count not in (0, None)):
             state = 'uncertain'
@@ -246,6 +270,141 @@ def compare(full, local, complete_coverage, requirement=None):
     return 'uncertain', []
 
 
+def compare_detailed(full, local, complete_coverage, requirement=None):
+    """Separate sound audibility from estimated-onset disagreement.
+
+    The two-value ``compare`` API remains unchanged for historical contract-v2
+    results. New contract-v3 results use this function so timing estimates can
+    conflict without erasing a sound whose presence/content both analyses found.
+    """
+    requirement = requirement or {}
+    conflicts = []
+    semantic_conflicts = []
+    timing_conflicts = []
+    positives = [x for x in local if x['state'] == 'present']
+    unknown = [x for x in local if x['state'] == 'uncertain']
+
+    if full['state'] == 'absent' and positives:
+        semantic_conflicts.append('full_absent_local_present')
+    if full['state'] == 'present' and not positives and not unknown and complete_coverage:
+        semantic_conflicts.append('full_present_local_absent')
+
+    specific_classes = {
+        row.get('sound_class') for row in [full, *positives]
+        if isinstance(row.get('sound_class'), str) and
+        row.get('sound_class') not in GENERIC_SOUND_CLASSES
+    }
+    if len(specific_classes) > 1:
+        semantic_conflicts.append('full_local_category_conflict')
+
+    discrete = requirement.get('event_kind') == 'discrete'
+    if full['state'] == 'present' and positives:
+        full_count = full.get('event_count')
+        if discrete or not requirement:
+            if full_count is not None and any(
+                    x.get('event_count') is not None and x['event_count'] > full_count
+                    for x in positives):
+                semantic_conflicts.append('local_count_exceeds_full')
+        if requirement.get('event_kind') != 'continuous':
+            full_times = full.get('source_event_times_sec', [])
+            full_uncertainty = full.get('time_uncertainty_sec')
+            if full_times:
+                for row in positives:
+                    if estimates_disagree(full_times, row.get('source_event_times_sec', []),
+                                          full_uncertainty, row.get('time_uncertainty_sec')):
+                        timing_conflicts.append('full_local_timing_conflict')
+                        break
+            for index, left in enumerate(positives):
+                left_start, left_end = left.get('source_start_time_sec'), left.get('source_end_time_sec')
+                for right in positives[index + 1:]:
+                    overlap_start = max(left_start, right.get('source_start_time_sec', math.inf))
+                    overlap_end = min(left_end, right.get('source_end_time_sec', -math.inf))
+                    if overlap_start >= overlap_end:
+                        continue
+                    left_times = [t for t in left.get('source_event_times_sec', [])
+                                  if overlap_start <= t <= overlap_end]
+                    right_times = [t for t in right.get('source_event_times_sec', [])
+                                   if overlap_start <= t <= overlap_end]
+                    if estimates_disagree(left_times, right_times,
+                                          left.get('time_uncertainty_sec'),
+                                          right.get('time_uncertainty_sec')):
+                        timing_conflicts.append('local_local_timing_conflict')
+                        break
+                if 'local_local_timing_conflict' in timing_conflicts:
+                    break
+        if discrete or not requirement:
+            # Counts from disjoint source intervals only; overlapping crops are
+            # not independent observations and must not inflate an event count.
+            chosen, last_end = [], -math.inf
+            for row in sorted(positives, key=lambda x: x.get('source_end_time_sec', math.inf)):
+                if row.get('source_start_time_sec', -math.inf) >= last_end:
+                    chosen.append(row)
+                    last_end = row.get('source_end_time_sec', math.inf)
+            if full_count is not None and sum(row.get('event_count') or 0 for row in chosen) > full_count:
+                semantic_conflicts.append('disjoint_local_count_exceeds_full')
+
+    conflicts = semantic_conflicts + timing_conflicts
+    failed = (full['state'] == 'analysis_failed' or not complete_coverage or
+              any(row['state'] == 'analysis_failed' for row in local))
+    if failed:
+        status = 'analysis_failed'
+    elif semantic_conflicts or full['state'] == 'uncertain':
+        status = 'uncertain'
+    elif full['state'] == 'present' and positives:
+        # Other masked windows do not negate a positive observation elsewhere.
+        status = 'confirmed_present'
+    elif full['state'] == 'absent' and local and all(row['state'] == 'absent' for row in local):
+        status = 'confirmed_absent'
+    else:
+        status = 'uncertain'
+
+    estimates = timing_estimates(full, local)
+    if timing_conflicts:
+        timing_status = 'conflict'
+    elif estimates['all_source_times_sec']:
+        timing_status = 'estimated'
+    elif requirement.get('event_kind') == 'continuous':
+        timing_status = 'not_applicable'
+    else:
+        timing_status = 'not_reported'
+    return status, conflicts, timing_status, estimates
+
+
+def estimates_disagree(left_times, right_times, left_uncertainty, right_uncertainty):
+    if not left_times or not right_times:
+        return False
+    tolerance = (left_uncertainty + right_uncertainty
+                 if finite(left_uncertainty) and finite(right_uncertainty) else .5)
+    tolerance = max(.5, tolerance)
+    return (any(all(abs(t - other) > tolerance for other in right_times) for t in left_times) or
+            any(all(abs(t - other) > tolerance for other in left_times) for t in right_times))
+
+
+def timing_estimates(full, local):
+    full_times = full.get('source_event_times_sec', [])
+    local_rows = [{
+        'segment_id': row.get('segment_id'),
+        'source_interval_sec': [row.get('source_start_time_sec'), row.get('source_end_time_sec')],
+        'event_times_sec': row.get('source_event_times_sec', []),
+        'time_uncertainty_sec': row.get('time_uncertainty_sec'),
+    } for row in local if row.get('source_event_times_sec')]
+    all_times = sorted({t for t in full_times + [t for row in local_rows for t in row['event_times_sec']]
+                        if finite(t)})
+    return {
+        'times_are_estimates': True,
+        'full_source_times_sec': full_times,
+        'local_estimates': local_rows,
+        'all_source_times_sec': all_times,
+    }
+
+
+def requires_visual_binding(requirement):
+    quote = str(requirement.get('prompt_quote') or '').lower()
+    shot_reference = bool(re.search(
+        r'\b(?:shot|scene)\s*\d+\b|\b(?:in|during|through)\s+(?:shot|scene)\b|镜头|画面|声画|同步', quote))
+    return shot_reference or bool(set(requirement.get('metric_ids') or []) & {'AV', 'LS'})
+
+
 def fulfillment(req, status, full):
     if status in {'uncertain', 'analysis_failed'}:
         return 'uncertain'
@@ -267,14 +426,22 @@ def assess(req, segments, interval):
     local = [r for r in rows if r['window_kind'] != 'full']
     coverage = [r for r in local if r['window_kind'] == 'coverage' and r['state'] != 'analysis_failed']
     complete = covers(coverage, interval)
-    status, conflicts = compare(full, local, complete, req)
-    return {**req, 'status':status, 'fulfillment':fulfillment(req,status,full),
+    status, conflicts, timing_status, estimates = compare_detailed(full, local, complete, req)
+    binding_required = requires_visual_binding(req)
+    return {**req, 'status':status, 'audibility_status':status,
+            'fulfillment':fulfillment(req,status,full),
+            'timing_status':timing_status, 'timing_conflicts':[x for x in conflicts if x in TIMING_CONFLICTS],
+            'timing_estimates':estimates,
+            'visual_binding_required':binding_required,
+            'visual_binding_status':'pending_visual_review' if binding_required else 'not_required',
             'coverage_complete':complete, 'full_review':full, 'local_reviews':local,
             'conflicts':conflicts, 'verified_by_listening':False}
 
 
 def listening_items(entry, full_segment):
-    if entry['fulfillment'] != 'uncertain':
+    needs_review = (entry['fulfillment'] == 'uncertain' or entry['status'] == 'analysis_failed' or
+                    entry.get('timing_status') == 'conflict')
+    if not needs_review:
         return []
     rows = entry['local_reviews']
     # Preserve every contested/failed interval. An unrelated early short clip cannot resolve a later conflict.
@@ -284,9 +451,33 @@ def listening_items(entry, full_segment):
     if not selected:
         selected = rows or [full_segment]
     unique = {r['audio_path']:r for r in selected}
+    priority = 'high' if entry['conflicts'] else 'medium'
     return [{'requirement_id':entry['requirement_id'], 'reason':entry['conflicts'] or [entry['status']],
-             'audio_path':r['audio_path'], 'source_interval_sec':[r['source_start_time_sec'],r['source_end_time_sec']]}
+             'priority':priority, 'audio_path':r['audio_path'],
+             'source_interval_sec':[r['source_start_time_sec'],r['source_end_time_sec']]}
             for r in sorted(unique.values(), key=lambda x:x['source_end_time_sec']-x['source_start_time_sec'])]
+
+
+def aggregate_listening_clips(queue):
+    """Provide one prioritized player entry per WAV while retaining item-level traceability."""
+    grouped = {}
+    for item in queue:
+        path = item['audio_path']
+        clip = grouped.setdefault(path, {
+            'audio_path':path,
+            'source_interval_sec':item['source_interval_sec'],
+            'requirement_ids':[],
+            'reason_codes':[],
+            'priority':'medium',
+        })
+        if item['requirement_id'] not in clip['requirement_ids']:
+            clip['requirement_ids'].append(item['requirement_id'])
+        for reason in item.get('reason') or []:
+            if reason not in clip['reason_codes']:
+                clip['reason_codes'].append(reason)
+        if item.get('priority') == 'high':
+            clip['priority'] = 'high'
+    return sorted(grouped.values(), key=lambda x: (x['priority'] != 'high', x['source_interval_sec'][0]))
 
 
 def analyze_group(group, requirements, output_dir, timeout, batch_id):
@@ -345,7 +536,7 @@ def review(run, output_dir, timeout=120, resume=False, batch_size=2):
     output_dir.mkdir(parents=True,exist_ok=True)
     if resume and output.exists():
         result = json.loads(output.read_text())
-        if (result.get('contract_version') != CONTRACT or result['source']['sha256'] != source_hash or
+        if (result.get('contract_version') not in {2, CONTRACT} or result['source']['sha256'] != source_hash or
                 result['source']['plan_sha256'] != context['plan_sha256'] or result.get('requested_requirements') != requirements):
             raise EvidenceError('Resume source, plan or contract mismatch')
         for s in result['segments']:
@@ -355,9 +546,11 @@ def review(run, output_dir, timeout=120, resume=False, batch_size=2):
         info = probe_media(media)
         result = {'schema_version':SCHEMA,'contract_version':CONTRACT,'status':'incomplete',
                   'source':{'path':str(media),'sha256':source_hash,'plan_sha256':context['plan_sha256'],**info},
-                  'requested_requirements':requirements,'requirements':[],'segments':[],'conflicts':[],'listening_queue':[],
+                  'requested_requirements':requirements,'requirements':[],'segments':[],'conflicts':[],
+                  'listening_queue':[],'listening_clips':[],'visual_binding_queue':[],
                   'analysis':{'method':'gemini_full_and_local_audio','times_are_estimates':True,
-                              'verified_by_listening':False,'pcm_is_semantic_evidence':False}}
+                              'verified_by_listening':False,'pcm_is_semantic_evidence':False,
+                              'timing_conflict_tolerance_sec':0.5}}
         write_json(output_dir/'media_probe.json',info)
         result['probe_path'],result['probe_sha256'] = str(output_dir/'media_probe.json'),sha256(output_dir/'media_probe.json')
         if info['has_audio_stream']:
@@ -389,8 +582,20 @@ def review(run, output_dir, timeout=120, resume=False, batch_size=2):
                 seg.update({'segment_id':sid,'kind':kind});result['segments'].append(seg)
         write_json(output,result)
     if not result['source']['has_audio_stream']:
-        result['requirements']=[{**r,'status':'confirmed_absent','fulfillment':fulfillment(r,'confirmed_absent',{}),
-                                 'conflicts':[],'verified_by_listening':False} for r in requirements]
+        empty_full = {'source_event_times_sec':[], 'time_uncertainty_sec':None}
+        result['requirements']=[{
+            **r, 'status':'confirmed_absent', 'audibility_status':'confirmed_absent',
+            'fulfillment':fulfillment(r,'confirmed_absent',{}),
+            'timing_status':'not_reported', 'timing_conflicts':[],
+            'timing_estimates':timing_estimates(empty_full, []),
+            'visual_binding_required':requires_visual_binding(r),
+            'visual_binding_status':'not_assessable_no_audio' if requires_visual_binding(r) else 'not_required',
+            'conflicts':[], 'verified_by_listening':False
+        } for r in requirements]
+        result['contract_version'] = CONTRACT
+        result['listening_queue'] = []
+        result['listening_clips'] = []
+        result['visual_binding_queue'] = []
         result['status']='complete';write_json(output,result);return result
     pending=[s for s in result['segments'] if s.get('status') != 'analyzed']
     groups=[]
@@ -407,6 +612,15 @@ def review(run, output_dir, timeout=120, resume=False, batch_size=2):
     result['requirements']=[assess(req,result['segments'],interval) for req in requirements]
     result['conflicts']=[{'requirement_id':r['requirement_id'],'reasons':r['conflicts']} for r in result['requirements'] if r['conflicts']]
     result['listening_queue']=[x for r in result['requirements'] for x in listening_items(r,full)]
+    result['listening_clips']=aggregate_listening_clips(result['listening_queue'])
+    result['visual_binding_queue']=[{
+        'requirement_id':r['requirement_id'],
+        'audibility_status':r['audibility_status'],
+        'timing_status':r['timing_status'],
+        'timing_estimates':r['timing_estimates'],
+        'status':'pending_visual_review',
+    } for r in result['requirements'] if r['visual_binding_required']]
+    result['contract_version'] = CONTRACT
     result['status']='incomplete' if any(r['status']=='analysis_failed' for r in result['requirements']) else 'complete'
     write_json(output,result)
     return result
@@ -424,6 +638,8 @@ def main():
         result=review(args.run,args.output_dir,args.timeout,args.resume,args.batch_size)
         print(json.dumps({'status':result['status'],'requirements':len(result['requirements']),
                           'listening_queue':len(result['listening_queue']),
+                          'listening_clips':len(result.get('listening_clips', [])),
+                          'visual_binding_queue':len(result.get('visual_binding_queue', [])),
                           'output':str(args.output_dir.resolve()/'audio_requirements.json')},ensure_ascii=False))
         return 0 if result['status']=='complete' else 2
     except (EvidenceError,OSError,KeyError,ValueError,TypeError,wave.Error) as exc:
