@@ -13,6 +13,7 @@ import re
 import sys
 import wave
 from inspection_coverage import inspection_frames
+from audio_review import compare as compare_audio_reviews
 
 from workflow_common import (
     DIMENSION_ISSUE_CATEGORY, ISSUE_METRICS, PHYSICAL_CLAIM_TYPES, SEVERITY_CAPS,
@@ -387,6 +388,89 @@ def validate_audio_boundaries(checks, metric_items, err):
         err("scores", "AF cannot be reduced when the Prompt has no explicit audio requirement")
 
 
+def validate_requirement_audio_result(record, review_dir, prepared, checks, metric_items, evidence, err):
+    """Apply the stronger gates only when the optional new evidence exists."""
+    path = review_dir / "audio" / "requirements" / "audio_requirements.json"
+    if not path.is_file():
+        return  # Historical reviews retain their existing validation contract.
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+        plan_path = review_dir / "workflow" / "plan.json"
+        state = json.loads((review_dir / "workflow" / "state.json").read_text(encoding="utf-8"))
+        frozen_sha = state["stages"]["plan"]["checkpoint_sha256"]
+    except (OSError, ValueError, KeyError, TypeError):
+        err("files", "Audio requirement result or frozen plan is unreadable")
+        return
+    if (result.get("schema_version") != "t2av_audio_requirements_v1" or
+            result.get("source", {}).get("sha256") != prepared.get("video_sha256") or
+            result.get("source", {}).get("plan_sha256") != frozen_sha or
+            sha256(plan_path) != frozen_sha):
+        err("references", "Audio requirement result does not match the video and frozen plan")
+        return
+    audio_checks = {x.get("requirement_id"): x for x in checks if x.get("claim_type") == "audio"}
+    entries = result.get("requirements")
+    if (not isinstance(entries, list) or len(entries) != len(audio_checks) or
+            len({x.get("requirement_id") for x in entries if isinstance(x, dict)}) != len(entries)):
+        err("references", "Audio requirement result must cover every frozen audio claim exactly once")
+        return
+    mapped = {x.get("requirement_id"): x for x in entries if isinstance(x, dict)}
+    if set(mapped) != set(audio_checks):
+        err("references", "Audio requirement IDs differ from frozen plan")
+        return
+    for segment in result.get("segments", []):
+        path_value = segment.get("audio_path")
+        if not isinstance(path_value, str) or not Path(path_value).is_file():
+            err("files", "Audio requirement segment is missing")
+        elif sha256(Path(path_value)) != segment.get("audio_sha256"):
+            err("files", "Audio requirement WAV hash mismatch")
+    uncertain_ids = set()
+    for rid, entry in mapped.items():
+        check = audio_checks[rid]
+        status = entry.get("status")
+        if entry.get("full_review") is not None:
+            try:
+                expected_status, expected_conflicts = compare_audio_reviews(
+                    entry["full_review"], entry["local_reviews"], bool(entry["local_reviews"]))
+                if status != expected_status or entry.get("conflicts") != expected_conflicts:
+                    err("scores", f"{rid}: audio verdict differs from saved full/local reviews")
+            except (KeyError, TypeError, ValueError):
+                err("scores", f"{rid}: invalid full/local audio reviews")
+        if entry.get("prompt_quote") != check.get("prompt_quote"):
+            err("references", f"{rid}: audio quote differs from frozen plan")
+        if status not in {"confirmed_present", "confirmed_absent", "uncertain", "analysis_failed"}:
+            err("scores", f"{rid}: invalid audio verdict")
+            continue
+        if status in {"uncertain", "analysis_failed"}:
+            uncertain_ids.add(rid)
+            if check.get("status") != "无法判断":
+                err("scores", f"{rid}: unresolved audio cannot be called absent or present")
+        elif status == "confirmed_present" and check.get("status") in {"未呈现", "与要求矛盾"}:
+            err("scores", f"{rid}: audible requirement cannot be called missing")
+        elif status == "confirmed_absent" and check.get("status") in {"已呈现", "部分呈现"}:
+            err("scores", f"{rid}: absent audio cannot be called present")
+        if entry.get("conflicts") and status != "uncertain":
+            err("scores", f"{rid}: audio conflict must remain uncertain")
+    for metric in metric_items:
+        if metric.get("metric_id") in AUDIO_METRICS and uncertain_ids.intersection(metric.get("requirement_ids") or []):
+            if metric.get("confidence") != "低" or not metric.get("uncertainty"):
+                err("scores", f"{metric.get('metric_id')}: unresolved audio needs low confidence and uncertainty")
+    for ev in evidence:
+        for sync in ev.get("synchronization") or []:
+            if sync.get("offset_sec") is None:
+                continue
+            rid = sync.get("audio_requirement_id")
+            entry = mapped.get(rid)
+            uncertainty = sync.get("time_uncertainty_sec")
+            if not entry or entry.get("status") != "confirmed_present":
+                err("scores", f"{ev.get('evidence_id')}: numeric AV offset needs confirmed audio requirement")
+            if (type(uncertainty) not in (int, float) or not math.isfinite(uncertainty) or
+                    uncertainty <= 0 or uncertainty > 0.1):
+                err("scores", f"{ev.get('evidence_id')}: AV offset lacks sufficient time precision")
+            if (not sync.get("measurement_method") or sync.get("visual_onset_sec") is None or
+                    sync.get("audio_onset_sec") is None or sync.get("audio_requirement_id") != rid):
+                err("scores", f"{ev.get('evidence_id')}: AV offset lacks traceable common-timeline timing")
+
+
 def validate(record, review_dir, boxes_reviewed):
     groups = {name: [] for name in ("references", "files", "coordinates", "scores")}
     def err(group, msg):
@@ -478,6 +562,7 @@ def validate(record, review_dir, boxes_reviewed):
         if check.get("status") not in ("已呈现", "部分呈现", "未呈现", "与要求矛盾", "无法判断"):
             err("scores", f"{check.get('requirement_id')}: invalid prompt check status")
     validate_audio_boundaries(checks, metric_items, err)
+    validate_requirement_audio_result(record, review_dir, prepared, checks, metric_items, evidence, err)
     frame_map = {f["frame_index"]: f for f in manifest}
     for ev in evidence:
         eid = ev.get("evidence_id")

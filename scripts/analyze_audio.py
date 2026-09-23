@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -135,30 +136,40 @@ def gateway_config():
     return key, base.rstrip("/"), model
 
 
-def call_gemini(wav, timeout, focus=None):
+def call_gemini(wav, timeout, focus=None, instruction_override=None, max_tokens=4000, stream=True):
     key, base, model = gateway_config()
-    instruction = PROMPT
+    instruction = instruction_override or PROMPT
     if focus:
         instruction += ("\nFocused question about the AUDIO ONLY: " + focus +
                         "\nState explicitly in audio_summary whether the event is audible, not audible "
                         "throughout this segment, or uncertain. An omitted sound_events entry is not a negative finding. "
                         "Do not use visual expectations as evidence.")
+    audio_inputs = wav if isinstance(wav, list) else [wav]
+    content = [{"type": "text", "text": instruction}]
+    for index, item in enumerate(audio_inputs):
+        label, path = item if isinstance(item, tuple) else (f"local_{index+1:03d}", item)
+        if isinstance(item, tuple) or len(audio_inputs) > 1:
+            content.append({"type": "text", "text": f"segment_id={label}; analyze this WAV independently."})
+        content.append({"type": "input_audio", "input_audio": {
+            "data": base64.b64encode(path.read_bytes()).decode("ascii"), "format": "wav"}})
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": instruction},
-            {"type": "input_audio", "input_audio": {
-                "data": base64.b64encode(wav.read_bytes()).decode("ascii"),
-                "format": "wav",
-            }},
-        ]}],
-        "stream": True, "temperature": 0.1,
-        "reasoning_effort": "medium", "max_tokens": 4000,
+        "messages": [{"role": "user", "content": content}],
+        "stream": stream, "temperature": 0.1,
+        "reasoning_effort": "medium", "max_tokens": max_tokens,
     }
     request = urllib.request.Request(
         base + "/chat/completions", data=json.dumps(payload).encode("utf-8"),
         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
     )
+    alarm_enabled = hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer")
+    previous_alarm = signal.getsignal(signal.SIGALRM) if alarm_enabled else None
+    previous_timer = signal.getitimer(signal.ITIMER_REAL) if alarm_enabled else None
+    def deadline(_signum, _frame):
+        raise TimeoutError("Gemini request exceeded hard timeout")
+    if alarm_enabled:
+        signal.signal(signal.SIGALRM, deadline)
+        signal.setitimer(signal.ITIMER_REAL, max(0.1, float(timeout)))
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             if "text/event-stream" in response.headers.get("Content-Type", ""):
@@ -203,6 +214,10 @@ def call_gemini(wav, timeout, focus=None):
         raise EvidenceError("Gemini request failed") from exc
     except (json.JSONDecodeError, UnicodeError, TypeError, KeyError) as exc:
         raise EvidenceError("Gemini returned invalid transport data") from exc
+    finally:
+        if alarm_enabled:
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+            signal.signal(signal.SIGALRM, previous_alarm)
     if finish != "stop" or not isinstance(content, str) or not content.strip():
         raise EvidenceError("Gemini response was incomplete or empty")
     raw = content.strip()
@@ -215,7 +230,8 @@ def call_gemini(wav, timeout, focus=None):
         raise EvidenceError("Gemini returned invalid JSON evidence") from exc
     if not isinstance(evidence, dict):
         raise EvidenceError("Gemini evidence must be a JSON object")
-    return {"evidence": evidence, "model": returned_model, "usage": usage}
+    return {"evidence": evidence, "model": returned_model, "usage": usage,
+            "raw_content": content, "transport": "stream" if stream else "non_stream"}
 
 
 def local_time(value, duration, label, limitations):
