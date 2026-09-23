@@ -8,7 +8,7 @@ import unittest
 import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from audio_review import compare, fulfillment, pcm_candidates, validate_reviews, windows
+from audio_review import compare, fulfillment, pcm_candidates, requirements_from_plan, validate_reviews, windows
 from review_result import validate_requirement_audio_result
 from analyze_audio import sha256
 
@@ -71,6 +71,28 @@ class AudioReviewTests(unittest.TestCase):
                 wav.writeframes(samples)
             peaks = pcm_candidates(path)
             self.assertTrue(any(0.45 <= t <= 0.55 for t in peaks))
+
+    def test_infers_exact_one_count_from_frozen_prompt(self):
+        requirements = requirements_from_plan({'prompt_checks': [{
+            'requirement_id': 'A', 'claim_type': 'audio',
+            'prompt_quote': 'exactly one starting-pistol shot',
+            'predicate': 'starting pistol shot', 'expected_after': None,
+            'metric_ids': ['AF']} ]})
+        self.assertEqual(requirements[0]['event_kind'], 'discrete')
+        self.assertEqual(requirements[0]['expected_count'], 1)
+        self.assertEqual(requirements[0]['polarity'], 'required')
+
+    def test_infers_forbidden_music_without_making_all_audio_forbidden(self):
+        forbidden = requirements_from_plan({'prompt_checks': [{
+            'requirement_id': 'A', 'claim_type': 'audio',
+            'prompt_quote': 'no non-diegetic music', 'predicate': 'music',
+            'expected_after': None, 'metric_ids': ['MU']} ]})[0]
+        self.assertEqual(forbidden['polarity'], 'forbidden')
+        shot = requirements_from_plan({'prompt_checks': [{
+            'requirement_id': 'B', 'claim_type': 'audio',
+            'prompt_quote': 'no second shot after the first', 'predicate': 'shot',
+            'expected_after': None, 'metric_ids': ['AF']} ]})[0]
+        self.assertEqual(shot['polarity'], 'required')
 
     def test_finalizer_rejects_uncertain_as_missing_and_precise_offset(self):
         with tempfile.TemporaryDirectory() as directory:

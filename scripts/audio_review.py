@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import sys
 import wave
 
@@ -41,14 +42,36 @@ def is_audio_claim(item):
             bool(set(item.get('metric_ids', [])) & AUDIO_CONTENT_METRICS))
 
 
+def infer_audio_spec(item, spec):
+    """Fill only conservative count/polarity cues stated literally in the quote."""
+    quote = f"{item.get('prompt_quote', '')} {item.get('expected_after', '')}".lower()
+    if spec.get('polarity') is None:
+        if re.search(r"\bno\s+(?:non[- ]diegetic\s+)?music\b|禁止配乐|没有音乐", quote):
+            spec['polarity'] = 'forbidden'
+        else:
+            spec['polarity'] = 'required'
+    if spec.get('event_kind') is None:
+        spec['event_kind'] = 'discrete' if re.search(
+            r"\b(?:exactly\s+one|single|once|one)\b|恰好一|单次|一次|一声", quote) else 'unknown'
+    if spec.get('expected_count') is None and spec.get('event_kind') == 'discrete' and re.search(
+            r"\b(?:exactly\s+one|single|once|one)\b|恰好一|单次|一次|一声", quote):
+        spec['expected_count'] = 1
+    return spec
+
+
 def requirements_from_plan(plan):
     result = []
     for item in plan['prompt_checks']:
         if not is_audio_claim(item):
             continue
-        spec = item.get('audio_spec', {})
-        if not isinstance(spec, dict):
+        raw_spec = item.get('audio_spec')
+        if raw_spec is None:
+            spec = {}
+        elif not isinstance(raw_spec, dict):
             raise EvidenceError('audio_spec must be an object')
+        else:
+            spec = dict(raw_spec)
+        spec = infer_audio_spec(item, spec)
         polarity = spec.get('polarity', 'required')
         kind = spec.get('event_kind', 'unknown')
         count = spec.get('expected_count')
